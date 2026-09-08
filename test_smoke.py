@@ -467,3 +467,361 @@ def test_index_page_renders(client):
     response = client.get("/")
     assert response.status_code == 200
     assert b"Salai" in response.data
+
+
+# ─── providers ────────────────────────────────────────────────────────────────
+
+
+def test_provider_catalogue_is_well_formed():
+    import providers
+
+    catalog = providers.public_catalog()
+    assert len(catalog) >= 5
+    for entry in catalog:
+        assert entry["id"] and entry["label"]
+        assert isinstance(entry["needs_key"], bool)
+        # A provider must offer a default model or the chat call cannot proceed.
+        assert entry["default_model"], entry["id"]
+
+
+def test_provider_catalogue_never_leaks_credentials():
+    """public() is serialised to the browser, so it must carry no secrets."""
+    import providers
+
+    blob = repr(providers.public_catalog())
+    assert "api_key" not in blob
+    assert os.environ["ADMIN_API_KEY"] not in blob
+
+
+def test_unknown_provider_is_rejected():
+    import providers
+
+    with pytest.raises(providers.ProviderError):
+        providers.get_spec("not-a-provider")
+
+
+def test_missing_key_is_reported_before_any_network_call():
+    import providers
+
+    with pytest.raises(providers.ProviderError) as excinfo:
+        providers.chat("openai", "gpt-4o", [{"role": "user", "content": "hi"}], api_key=None)
+    assert "API key" in str(excinfo.value)
+
+
+def test_only_image_capable_providers_generate_images():
+    """The dentsu gateway blocks non-chat models, so it must refuse early."""
+    import providers
+
+    with pytest.raises(providers.ProviderError) as excinfo:
+        providers.generate_image("dentsu", "a red square")
+    assert "cannot generate images" in str(excinfo.value)
+
+
+def test_system_message_is_split_out_for_anthropic():
+    import providers
+
+    system, turns = providers._split_system(
+        [
+            {"role": "system", "content": "be terse"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+    )
+    assert system == "be terse"
+    assert [t["role"] for t in turns] == ["user", "assistant"]
+
+
+def test_adaptive_thinking_models_skip_temperature():
+    """Newer Claude models reject sampling params, so they must be omitted."""
+    import providers
+
+    assert providers._is_adaptive_thinking_model("claude-opus-5") is True
+    assert providers._is_adaptive_thinking_model("claude-sonnet-5") is True
+    assert providers._is_adaptive_thinking_model("claude-haiku-4-5") is False
+
+
+# ─── settings store ───────────────────────────────────────────────────────────
+
+
+def test_settings_default_to_the_dentsu_provider():
+    from settings_store import SettingsStore
+
+    store = SettingsStore()
+    settings = store.get("u1")
+    assert settings["provider"] == "dentsu"
+    assert settings["model"]  # defaulted from the provider spec
+
+
+def test_api_key_is_never_returned_to_the_client():
+    from settings_store import SettingsStore
+
+    store = SettingsStore()
+    store.update("u1", {"provider": "openai", "api_key": "sk-secret-abcdef123456"})
+
+    state = store.public_state("u1")
+    assert "sk-secret-abcdef123456" not in repr(state)
+    # A masked hint is fine, and lets the UI show that a key exists.
+    assert state["saved_keys"]["openai"].endswith("3456")
+    assert state["settings"]["has_key"] is True
+    # The raw value is still retrievable server-side for the actual call.
+    assert store.api_key("u1", "openai") == "sk-secret-abcdef123456"
+
+
+def test_keys_are_isolated_between_users():
+    from settings_store import SettingsStore
+
+    store = SettingsStore()
+    store.update("alice", {"provider": "openai", "api_key": "sk-alice"})
+    assert store.api_key("bob", "openai") is None
+
+
+def test_keys_are_kept_per_provider():
+    from settings_store import SettingsStore
+
+    store = SettingsStore()
+    store.update("u1", {"provider": "openai", "api_key": "sk-openai"})
+    store.update("u1", {"provider": "anthropic", "api_key": "sk-ant"})
+    assert store.api_key("u1", "openai") == "sk-openai"
+    assert store.api_key("u1", "anthropic") == "sk-ant"
+
+
+def test_switching_provider_clears_the_stale_model():
+    """A GPT deployment name must not leak into an Anthropic request."""
+    from settings_store import SettingsStore
+
+    store = SettingsStore()
+    store.update("u1", {"provider": "openai", "model": "gpt-4o"})
+    store.update("u1", {"provider": "anthropic"})
+    assert store.get("u1")["model"].startswith("claude-")
+
+
+def test_clearing_a_key_removes_it():
+    from settings_store import SettingsStore
+
+    store = SettingsStore()
+    store.update("u1", {"provider": "openai", "api_key": "sk-x"})
+    assert store.clear_key("u1", "openai")["removed"] is True
+    assert store.api_key("u1", "openai") is None
+
+
+def test_blank_api_key_clears_rather_than_stores():
+    from settings_store import SettingsStore
+
+    store = SettingsStore()
+    store.update("u1", {"provider": "openai", "api_key": "sk-x"})
+    store.update("u1", {"api_key": "   "})
+    assert store.api_key("u1", "openai") is None
+
+
+def test_settings_reject_bad_values():
+    from settings_store import SettingsStore
+
+    store = SettingsStore()
+    assert store.update("u1", {"provider": "nope"})["status"] == "error"
+    assert store.update("u1", {"output_format": "nope"})["status"] == "error"
+    assert store.update("u1", {"temperature": "hot"})["status"] == "error"
+    assert store.update("u1", {"max_tokens": "many"})["status"] == "error"
+
+
+def test_numeric_settings_are_clamped():
+    from settings_store import SettingsStore
+
+    store = SettingsStore()
+    store.update("u1", {"temperature": 99, "max_tokens": 10**9})
+    settings = store.get("u1")
+    assert settings["temperature"] <= 2.0
+    assert settings["max_tokens"] <= 128000
+
+
+# ─── exporters ────────────────────────────────────────────────────────────────
+
+
+def test_csv_export_round_trips():
+    import csv as csvmod
+    import io as iomod
+
+    import exporters
+
+    data, mimetype, filename = exporters.build(
+        "csv", {"headers": ["Client", "Spend"], "rows": [["Acme", "1,200"]], "title": "q3"}
+    )
+    assert "csv" in mimetype and filename.endswith(".csv")
+    rows = list(csvmod.reader(iomod.StringIO(data.decode("utf-8-sig"))))
+    assert rows[0] == ["Client", "Spend"]
+    # "1,200" must survive as one numeric cell, not split across two columns.
+    assert rows[1] == ["Acme", "1200"]
+
+
+def test_csv_quotes_fields_containing_commas():
+    import csv as csvmod
+    import io as iomod
+
+    import exporters
+
+    data, _, _ = exporters.build("csv", {"headers": ["Name"], "rows": [["Acme, Inc."]]})
+    rows = list(csvmod.reader(iomod.StringIO(data.decode("utf-8-sig"))))
+    assert rows[1] == ["Acme, Inc."]
+
+
+def test_xlsx_export_is_a_real_workbook():
+    import io as iomod
+
+    import exporters
+
+    openpyxl = pytest.importorskip("openpyxl")
+    data, mimetype, filename = exporters.build(
+        "xlsx", {"headers": ["Month", "Revenue"], "rows": [["Jan", "1000"], ["Feb", "2000"]]}
+    )
+    assert filename.endswith(".xlsx")
+    assert "spreadsheetml" in mimetype
+    sheet = openpyxl.load_workbook(iomod.BytesIO(data)).active
+    assert [c.value for c in sheet[1]] == ["Month", "Revenue"]
+    # Numbers must be numeric so Excel can total and chart them.
+    assert sheet["B2"].value == 1000
+    assert isinstance(sheet["B2"].value, (int, float))
+
+
+def test_ragged_rows_are_padded_to_a_rectangle():
+    import exporters
+
+    headers, rows = exporters.normalise_table(
+        {"headers": ["A", "B", "C"], "rows": [["1"], ["1", "2", "3"]]}
+    )
+    assert len(headers) == 3
+    assert all(len(r) == 3 for r in rows)
+
+
+def test_export_rejects_empty_and_malformed_tables():
+    import exporters
+
+    with pytest.raises(exporters.ExportError):
+        exporters.normalise_table({"headers": [], "rows": []})
+    with pytest.raises(exporters.ExportError):
+        exporters.normalise_table({"headers": ["A"], "rows": ["not-a-row"]})
+    with pytest.raises(exporters.ExportError):
+        exporters.build("pdf", {"headers": ["A"], "rows": [["1"]]})
+
+
+def test_export_filenames_are_filesystem_safe():
+    import exporters
+
+    name = exporters.safe_filename("../../etc/pa:sswd*?<>|", "csv")
+    assert name.endswith(".csv")
+    for bad in ["/", "\\", ":", "*", "?", "<", ">", "|", ".."]:
+        assert bad not in name
+
+
+def test_percentages_keep_their_unit():
+    import exporters
+
+    _headers, rows = exporters.normalise_table({"headers": ["Rate"], "rows": [["12.5%"]]})
+    assert rows[0][0] == "12.5%"
+
+
+def test_parenthesised_negatives_become_negative_numbers():
+    import exporters
+
+    _headers, rows = exporters.normalise_table({"headers": ["Delta"], "rows": [["(250)"]]})
+    assert rows[0][0] == -250
+
+
+# ─── settings + export HTTP surface ───────────────────────────────────────────
+
+
+def test_settings_endpoint_exposes_catalogue_without_secrets(client):
+    response = client.get("/settings")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["status"] == "success"
+    assert any(p["id"] == "anthropic" for p in body["providers"])
+    assert os.environ["ADMIN_API_KEY"] not in response.get_data(as_text=True)
+
+
+def test_settings_needs_no_admin_key(client):
+    """Provider config is per-user, so it must not require the admin key."""
+    assert client.get("/settings").status_code == 200
+
+
+def test_settings_round_trip_over_http(client):
+    response = client.post("/settings", json={"provider": "openrouter", "output_format": "table"})
+    assert response.status_code == 200, response.get_json()
+    body = response.get_json()
+    assert body["settings"]["provider"] == "openrouter"
+    assert body["settings"]["output_format"] == "table"
+
+
+def test_settings_rejects_unknown_fields(client):
+    response = client.post("/settings", json={"totally_made_up": 1})
+    assert response.status_code == 400
+    assert "Unknown setting" in response.get_json()["message"]
+
+
+def test_posted_api_key_is_not_echoed_back(client):
+    response = client.post(
+        "/settings", json={"provider": "openai", "api_key": "sk-live-do-not-echo-1234"}
+    )
+    assert response.status_code == 200
+    assert "sk-live-do-not-echo-1234" not in response.get_data(as_text=True)
+
+
+def test_export_endpoint_returns_a_csv_attachment(client):
+    response = client.post(
+        "/export/csv", json={"headers": ["A", "B"], "rows": [["1", "2"]], "title": "t"}
+    )
+    assert response.status_code == 200
+    assert "attachment" in response.headers["Content-Disposition"]
+    assert b"A,B" in response.data
+
+
+def test_export_endpoint_rejects_junk(client):
+    assert client.post("/export/csv", json={"headers": [], "rows": []}).status_code == 400
+    assert client.post("/export/docx", json={"headers": ["A"], "rows": [["1"]]}).status_code == 400
+
+
+def test_image_generation_blocked_on_the_dentsu_gateway(client):
+    response = client.post("/generate/image", json={"prompt": "a red square"})
+    assert response.status_code == 400
+    assert "cannot generate images" in response.get_json()["message"]
+
+
+def test_image_generation_needs_a_prompt(client):
+    assert client.post("/generate/image", json={}).status_code == 400
+
+
+def test_output_format_reaches_the_system_prompt(indexed_kb):
+    """Choosing 'table' must actually steer the model, not just the UI."""
+    import app as app_module
+    from settings_store import settings_store
+
+    settings_store.update("fmt-user", {"output_format": "table"})
+    with app_module.app.test_request_context("/"):
+        messages, meta = app_module.build_messages("chat-fmt", "list our regions", "fmt-user")
+
+    assert meta["output_format"] == "table"
+    assert "Markdown table" in messages[0]["content"]
+
+
+def test_auto_format_adds_no_instruction(indexed_kb):
+    import app as app_module
+    from settings_store import settings_store
+
+    settings_store.update("plain-user", {"output_format": "auto"})
+    with app_module.app.test_request_context("/"):
+        messages, meta = app_module.build_messages("chat-auto", "hello there", "plain-user")
+
+    assert meta["output_format"] == "auto"
+    assert "Requested output format" not in messages[0]["content"]
+
+
+def test_chart_format_documents_the_fenced_block(indexed_kb):
+    """The renderer only understands ```chart, so the prompt must specify it."""
+    import app as app_module
+    from settings_store import settings_store
+
+    settings_store.update("chart-user", {"output_format": "chart"})
+    with app_module.app.test_request_context("/"):
+        messages, _meta = app_module.build_messages("chat-chart", "revenue by region", "chart-user")
+
+    system = messages[0]["content"]
+    assert "```chart" in system
+    assert "datasets" in system and "labels" in system

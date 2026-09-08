@@ -7,6 +7,8 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <!-- Renders ```chart blocks the model emits into real graphs. -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -19,21 +21,29 @@
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
+            /* Pin the viewport so the header stays put and only #chat scrolls.
+               With min-height the whole page grew and the header scrolled off. */
+            height: 100vh;
+            overflow: hidden;
             display: flex;
             flex-direction: column;
         }
 
         .header {
-            background: rgba(255, 255, 255, 0.1);
+            background: rgba(102, 126, 234, 0.95);
             backdrop-filter: blur(10px);
-            padding: 1rem;
+            padding: 0.85rem 1rem;
             color: white;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.18);
             display: flex;
             align-items: center;
             justify-content: space-between;
             gap: 1rem;
+            /* Frozen: never scrolls away, always above the panel and messages. */
+            flex: 0 0 auto;
+            position: sticky;
+            top: 0;
+            z-index: 100;
         }
 
         .header h1 {
@@ -70,27 +80,31 @@
         }
 
         .chat-container {
-            flex: 1;
+            /* min-height:0 lets the flex child actually shrink, which is what
+               confines scrolling to #chat instead of stretching the page. */
+            flex: 1 1 auto;
+            min-height: 0;
             display: flex;
             flex-direction: column;
-            max-width: 800px;
-            margin: 0 auto;
+            max-width: 900px;
+            margin: 1rem auto;
             width: 100%;
-            background: rgba(255, 255, 255, 0.95);
+            background: rgba(255, 255, 255, 0.97);
             border-radius: 10px;
-            margin-top: 1rem;
-            margin-bottom: 1rem;
             box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
             overflow: hidden;
         }
 
         #chat {
-            flex: 1;
+            flex: 1 1 auto;
+            min-height: 0;
             overflow-y: auto;
+            overflow-x: hidden;
             padding: 1rem;
             display: flex;
             flex-direction: column;
             gap: 1rem;
+            scroll-behavior: smooth;
         }
 
         .message {
@@ -151,25 +165,285 @@
 
         .input-area {
             border-top: 1px solid #e0e0e0;
-            padding: 1rem;
+            padding: 0.75rem 1rem 1rem;
             background: white;
             display: flex;
             gap: 0.5rem;
-            align-items: center;
+            /* flex-end so the buttons stay on the last line as the box grows. */
+            align-items: flex-end;
+            flex: 0 0 auto;
         }
 
+        /* A textarea, not an input: Enter sends, Shift+Enter adds a newline,
+           and the box grows with the content up to a cap. */
         #message {
             flex: 1;
-            padding: 0.75rem 1rem;
+            padding: 0.7rem 1rem;
             border: 2px solid #e0e0e0;
-            border-radius: 25px;
+            border-radius: 20px;
             outline: none;
             font-size: 1rem;
-            transition: border-color 0.3s;
+            font-family: inherit;
+            line-height: 1.45;
+            transition: border-color 0.2s;
+            resize: none;
+            overflow-y: auto;
+            min-height: 2.9rem;
+            max-height: 11rem;
         }
 
         #message:focus {
             border-color: #667eea;
+        }
+
+        .input-hint {
+            font-size: 0.68rem;
+            color: #aaa;
+            padding: 0 1rem 0.5rem;
+            background: white;
+            flex: 0 0 auto;
+        }
+
+        /* ─── Format selector (steers the answer's shape) ────────────────── */
+        .format-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.55rem 1rem 0;
+            background: white;
+            flex-wrap: wrap;
+            flex: 0 0 auto;
+        }
+        .format-bar-label {
+            font-size: 0.7rem;
+            color: #999;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-right: 0.2rem;
+        }
+        .format-chip {
+            border: 1px solid #ddd;
+            background: #fafafa;
+            color: #666;
+            border-radius: 14px;
+            padding: 0.22rem 0.65rem;
+            font-size: 0.75rem;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .format-chip:hover { border-color: #667eea; color: #667eea; }
+        .format-chip.active {
+            background: #667eea;
+            border-color: #667eea;
+            color: white;
+        }
+
+        /* ─── Rich output: tables, charts, per-message actions ───────────── */
+        .message-content table {
+            border-collapse: collapse;
+            margin: 0.6rem 0;
+            font-size: 0.85rem;
+            width: 100%;
+            display: block;
+            overflow-x: auto;
+            white-space: nowrap;
+        }
+        .message-content th,
+        .message-content td {
+            border: 1px solid #e1e4e8;
+            padding: 0.4rem 0.6rem;
+            text-align: left;
+        }
+        .message-content th {
+            background: #667eea;
+            color: white;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+        }
+        .message-content tbody tr:nth-child(even) { background: #f7f8fc; }
+        .message-content tbody tr:hover { background: #eef0fb; }
+
+        .chart-wrap {
+            margin: 0.7rem 0;
+            padding: 0.7rem;
+            background: white;
+            border: 1px solid #e1e4e8;
+            border-radius: 8px;
+        }
+        .chart-wrap canvas { max-width: 100%; }
+        .chart-error {
+            font-size: 0.8rem;
+            color: #c62828;
+            padding: 0.5rem;
+        }
+
+        /* Export / copy buttons attached to a message or a table. */
+        .output-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.3rem;
+            margin-top: 0.5rem;
+            padding-top: 0.45rem;
+            border-top: 1px dashed #dfe2ea;
+        }
+        .output-btn {
+            border: 1px solid #d8dce6;
+            background: white;
+            color: #5a5a72;
+            border-radius: 12px;
+            padding: 0.2rem 0.55rem;
+            font-size: 0.7rem;
+            font-family: inherit;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.28rem;
+            transition: all 0.15s;
+        }
+        .output-btn:hover {
+            border-color: #667eea;
+            color: #667eea;
+            background: #f5f6fe;
+        }
+        .output-btn:disabled { opacity: 0.5; cursor: default; }
+
+        /* ─── Settings modal ────────────────────────────────────────────── */
+        .modal-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            z-index: 200;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }
+        .modal-backdrop.open { display: flex; }
+
+        .modal {
+            background: white;
+            border-radius: 12px;
+            width: 100%;
+            max-width: 560px;
+            max-height: 88vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        .modal-head {
+            padding: 1rem 1.2rem;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .modal-head h2 { font-size: 1.05rem; font-weight: 600; color: #333; }
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 1.3rem;
+            color: #999;
+            cursor: pointer;
+            line-height: 1;
+        }
+        .modal-close:hover { color: #333; }
+        .modal-body { padding: 1.2rem; overflow-y: auto; }
+        .modal-foot {
+            padding: 0.9rem 1.2rem;
+            border-top: 1px solid #eee;
+            display: flex;
+            gap: 0.5rem;
+            justify-content: flex-end;
+        }
+
+        .field { margin-bottom: 1rem; }
+        .field label {
+            display: block;
+            font-size: 0.78rem;
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 0.3rem;
+        }
+        .field-hint {
+            font-size: 0.72rem;
+            color: #999;
+            margin-top: 0.25rem;
+            line-height: 1.4;
+        }
+        .field input[type="text"],
+        .field input[type="password"],
+        .field input[type="number"],
+        .field select {
+            width: 100%;
+            padding: 0.55rem 0.7rem;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 0.88rem;
+            font-family: inherit;
+            outline: none;
+        }
+        .field input:focus, .field select:focus { border-color: #667eea; }
+        .field-row { display: flex; gap: 0.5rem; }
+        .field-row > * { flex: 1; }
+
+        .key-status {
+            font-size: 0.72rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 10px;
+            display: inline-block;
+            margin-top: 0.3rem;
+        }
+        .key-status.set { background: #e8f5e8; color: #2e7d32; }
+        .key-status.unset { background: #fff3e0; color: #ef6c00; }
+
+        .provider-note {
+            font-size: 0.75rem;
+            color: #666;
+            background: #f5f6fe;
+            border-left: 3px solid #667eea;
+            padding: 0.5rem 0.7rem;
+            border-radius: 4px;
+            margin-bottom: 1rem;
+            line-height: 1.45;
+        }
+
+        .model-pill {
+            font-size: 0.68rem;
+            background: rgba(255, 255, 255, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            padding: 0.15rem 0.5rem;
+            border-radius: 10px;
+            margin-left: 0.4rem;
+            white-space: nowrap;
+        }
+
+        /* Print: only the message being exported, styled for paper. */
+        @media print {
+            body { background: white; height: auto; overflow: visible; }
+            .header, .input-area, .format-bar, .input-hint,
+            .attachment-strip, .context-panel, .typing,
+            .output-actions, .toast-container, .modal-backdrop { display: none !important; }
+            .chat-container {
+                box-shadow: none;
+                margin: 0;
+                max-width: none;
+                background: white;
+                overflow: visible;
+            }
+            #chat { overflow: visible; padding: 0; }
+            .message { page-break-inside: avoid; }
+            .message.print-hide { display: none !important; }
+            .message .avatar { display: none; }
+            .message-content {
+                max-width: none !important;
+                background: white !important;
+                color: black !important;
+                box-shadow: none !important;
+            }
+            .message-content table { white-space: normal; display: table; }
+            .message-content th { background: #eee !important; color: black !important; }
         }
 
         .btn {
@@ -477,6 +751,11 @@
     <div class="header">
         <h1><i class="fas fa-robot"></i> Salai</h1>
         <div class="header-actions">
+            <span class="model-pill" id="modelPill" title="Active provider and model">…</span>
+            <button class="header-btn" onclick="openSettings()" title="Choose an AI model and set your API keys">
+                <i class="fas fa-sliders"></i>
+                <span>Settings</span>
+            </button>
             <button class="header-btn" onclick="startNewChat()" title="Clear this conversation and its attachments">
                 <i class="fas fa-rotate-left"></i>
                 <span>New chat</span>
@@ -551,8 +830,13 @@
         <!-- Files attached to this conversation. Populated from /chat/list_context. -->
         <div class="attachment-strip" id="attachmentStrip"></div>
 
+        <!-- Output shape. Sets a system instruction for subsequent answers. -->
+        <div class="format-bar" id="formatBar">
+            <span class="format-bar-label">Format</span>
+        </div>
+
         <div class="input-area">
-            <input type="text" id="message" placeholder="Type your message...">
+            <textarea id="message" rows="1" placeholder="Type your message…  (Shift+Enter for a new line)"></textarea>
 
             <!-- Attach to this chat: one click, straight to the file picker. -->
             <input type="file" id="chatFileInput" multiple
@@ -570,7 +854,88 @@
                 <i class="fas fa-microphone"></i>
             </button>
         </div>
+        <div class="input-hint">Enter sends · Shift+Enter for a new line</div>
 
+    </div>
+
+    <!-- ─── Settings: provider, model, credentials ─────────────────────── -->
+    <div class="modal-backdrop" id="settingsModal" onclick="if(event.target===this)closeSettings()">
+        <div class="modal">
+            <div class="modal-head">
+                <h2><i class="fas fa-sliders"></i> AI model &amp; credentials</h2>
+                <button class="modal-close" onclick="closeSettings()" title="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="provider-note" id="providerNote"></div>
+
+                <div class="field">
+                    <label for="providerSelect">Provider</label>
+                    <select id="providerSelect" onchange="onProviderChange()"></select>
+                </div>
+
+                <!-- Only shown for providers that need a key. -->
+                <div class="field" id="apiKeyField">
+                    <label for="apiKeyInput">Your API key</label>
+                    <div class="field-row">
+                        <input type="password" id="apiKeyInput" placeholder="Paste your key…"
+                               autocomplete="off" spellcheck="false">
+                        <button class="btn btn-secondary" style="flex:0 0 auto;padding:0.55rem 0.8rem"
+                                onclick="clearApiKey()" title="Forget the stored key">
+                            <i class="fas fa-trash-alt"></i>
+                        </button>
+                    </div>
+                    <div id="keyStatus"></div>
+                    <div class="field-hint">
+                        Held in server memory for your session only — never written to disk,
+                        never logged, and never sent back to the browser.
+                        <a id="keyLink" href="#" target="_blank" rel="noopener">Get a key</a>
+                    </div>
+                </div>
+
+                <div class="field" id="baseUrlField">
+                    <label for="baseUrlInput">Base URL</label>
+                    <input type="text" id="baseUrlInput" placeholder="https://…" spellcheck="false">
+                    <div class="field-hint">
+                        For self-hosted servers, e.g. <code>http://localhost:11434/v1</code> (Ollama)
+                        or <code>http://localhost:8000/v1</code> (vLLM).
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="modelInput">Model</label>
+                    <div class="field-row">
+                        <input type="text" id="modelInput" list="modelOptions"
+                               placeholder="Model id…" spellcheck="false">
+                        <datalist id="modelOptions"></datalist>
+                        <button class="btn btn-secondary" style="flex:0 0 auto;padding:0.55rem 0.8rem"
+                                id="fetchModelsBtn" onclick="fetchModels()" title="Fetch the list from the provider">
+                            <i class="fas fa-rotate"></i>
+                        </button>
+                    </div>
+                    <div class="field-hint">Pick from the list or type any model id your provider serves.</div>
+                </div>
+
+                <div class="field field-row">
+                    <div>
+                        <label for="temperatureInput">Temperature</label>
+                        <input type="number" id="temperatureInput" min="0" max="2" step="0.1">
+                    </div>
+                    <div>
+                        <label for="maxTokensInput">Max response tokens</label>
+                        <input type="number" id="maxTokensInput" min="256" max="128000" step="256">
+                    </div>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <button class="btn btn-secondary" onclick="testConnection()" id="testBtn">
+                    <i class="fas fa-plug"></i> Test
+                </button>
+                <button class="btn btn-secondary" onclick="resetSettings()">Reset</button>
+                <button class="btn btn-primary" onclick="saveSettings()" id="saveSettingsBtn">
+                    <i class="fas fa-check"></i> Save
+                </button>
+            </div>
+        </div>
     </div>
 
     <!-- Toast notifications -->
@@ -612,12 +977,15 @@
             if (type === 'user') {
                 messageContent.textContent = originalCommand || content;
             } else {
-                // Render markdown for bot messages
-                messageContent.innerHTML = marked.parse(content);
-                // Highlight code blocks
+                // Pull ```chart blocks out before Markdown runs, so their JSON
+                // is never mangled by the renderer, then draw them after.
+                const { text, charts } = extractCharts(content);
+                messageContent.innerHTML = marked.parse(text);
                 messageContent.querySelectorAll('pre code').forEach((block) => {
                     hljs.highlightElement(block);
                 });
+                renderCharts(messageContent, charts);
+                addOutputActions(messageContent, content);
             }
 
             messageDiv.appendChild(avatar);
@@ -625,6 +993,7 @@
             chat.appendChild(messageDiv);
 
             chat.scrollTop = chat.scrollHeight;
+            return messageDiv;
         }
 
         function sendMessage() {
@@ -634,8 +1003,17 @@
                 showTyping();
                 socket.emit('voice_command', {command: message});
                 messageInput.value = '';
+                autoGrow();
             }
         }
+
+        // ── Multi-line input ───────────────────────────────────────────────
+        // Grow with the content up to the CSS max-height, then scroll.
+        function autoGrow() {
+            messageInput.style.height = 'auto';
+            messageInput.style.height = Math.min(messageInput.scrollHeight, 176) + 'px';
+        }
+        messageInput.addEventListener('input', autoGrow);
 
         function showTyping() {
             typingIndicator.style.display = 'block';
@@ -675,10 +1053,14 @@
             }
         }
 
-        messageInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                sendMessage();
-            }
+        // keydown, not keypress: we need to see the Shift modifier and be able
+        // to suppress the newline that Enter would otherwise insert.
+        messageInput.addEventListener('keydown', function (e) {
+            if (e.key !== 'Enter') return;
+            if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;  // newline
+            if (e.isComposing) return;  // don't send mid-IME composition
+            e.preventDefault();
+            sendMessage();
         });
 
         // Initialize highlight.js
@@ -1111,6 +1493,567 @@
             btn.innerHTML = '<i class="fas fa-upload"></i> Upload &amp; Index';
             loadContextStatus();
         }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Rich output: charts, tables, exports
+        // ═══════════════════════════════════════════════════════════════
+
+        const CHART_COLORS = [
+            '#667eea', '#764ba2', '#f5a623', '#43a047', '#e53935',
+            '#00acc1', '#8e24aa', '#fb8c00', '#3949ab', '#00897b'
+        ];
+
+        // Lifted out before Markdown parsing: a ```chart fence holds JSON, and
+        // running it through the Markdown renderer first would escape or
+        // reflow it. Returns the text with each block replaced by a placeholder.
+        function extractCharts(markdown) {
+            const charts = [];
+            const text = markdown.replace(
+                /```chart\s*\n([\s\S]*?)```/g,
+                (_match, body) => {
+                    const index = charts.length;
+                    charts.push(body.trim());
+                    return `\n<div data-chart-slot="${index}"></div>\n`;
+                }
+            );
+            return { text, charts };
+        }
+
+        function renderCharts(container, charts) {
+            charts.forEach((raw, index) => {
+                const slot = container.querySelector(`[data-chart-slot="${index}"]`);
+                if (!slot) return;
+
+                let spec;
+                try {
+                    spec = JSON.parse(raw);
+                } catch (e) {
+                    slot.className = 'chart-error';
+                    slot.textContent = 'Could not read the chart data the model produced.';
+                    return;
+                }
+
+                const problem = validateChartSpec(spec);
+                if (problem) {
+                    slot.className = 'chart-error';
+                    slot.textContent = `Chart data problem: ${problem}`;
+                    return;
+                }
+
+                const wrap = document.createElement('div');
+                wrap.className = 'chart-wrap';
+                const canvas = document.createElement('canvas');
+                wrap.appendChild(canvas);
+                slot.replaceWith(wrap);
+
+                const isCircular = spec.type === 'pie' || spec.type === 'doughnut';
+                const datasets = spec.datasets.map((ds, i) => ({
+                    label: ds.label || `Series ${i + 1}`,
+                    data: ds.data,
+                    backgroundColor: isCircular
+                        ? spec.labels.map((_l, j) => CHART_COLORS[j % CHART_COLORS.length])
+                        : CHART_COLORS[i % CHART_COLORS.length],
+                    borderColor: CHART_COLORS[i % CHART_COLORS.length],
+                    borderWidth: spec.type === 'line' ? 2 : 1,
+                    fill: false,
+                    tension: 0.25
+                }));
+
+                try {
+                    const chartObj = new Chart(canvas, {
+                        type: spec.type,
+                        data: { labels: spec.labels, datasets },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: true,
+                            aspectRatio: 1.9,
+                            plugins: {
+                                legend: {
+                                    display: datasets.length > 1 || isCircular,
+                                    position: 'bottom',
+                                    labels: { boxWidth: 12, font: { size: 11 } }
+                                },
+                                title: {
+                                    display: Boolean(spec.title),
+                                    text: spec.title || '',
+                                    font: { size: 13 }
+                                }
+                            },
+                            scales: isCircular ? {} : {
+                                y: { beginAtZero: true, ticks: { font: { size: 10 } } },
+                                x: { ticks: { font: { size: 10 } } }
+                            }
+                        }
+                    });
+                    // Remember the spec so the chart can be exported as data too.
+                    wrap.__chartSpec = spec;
+                    wrap.__chartObj = chartObj;
+                    addChartActions(wrap, spec, canvas);
+                } catch (e) {
+                    wrap.className = 'chart-error';
+                    wrap.textContent = `Could not draw the chart: ${e.message}`;
+                }
+            });
+        }
+
+        function validateChartSpec(spec) {
+            const allowed = ['bar', 'line', 'pie', 'doughnut', 'radar', 'scatter'];
+            if (!spec || typeof spec !== 'object') return 'not an object';
+            if (!allowed.includes(spec.type)) return `unsupported type "${spec.type}"`;
+            if (!Array.isArray(spec.labels) || spec.labels.length === 0) return 'no labels';
+            if (!Array.isArray(spec.datasets) || spec.datasets.length === 0) return 'no datasets';
+            for (const ds of spec.datasets) {
+                if (!Array.isArray(ds.data)) return 'a dataset has no data array';
+                if (ds.data.length !== spec.labels.length) {
+                    return `a dataset has ${ds.data.length} points but there are ${spec.labels.length} labels`;
+                }
+                if (ds.data.some(v => typeof v !== 'number' || !isFinite(v))) {
+                    return 'a dataset contains non-numeric values';
+                }
+            }
+            return null;
+        }
+
+        // ── Reading tables back out of rendered HTML ───────────────────────
+        function tableToData(tableEl) {
+            const headers = Array.from(tableEl.querySelectorAll('thead th'))
+                .map(th => th.textContent.trim());
+            const rows = Array.from(tableEl.querySelectorAll('tbody tr')).map(tr =>
+                Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim())
+            );
+            if (!headers.length && rows.length) {
+                // Markdown always emits a thead, but be tolerant.
+                return { headers: rows[0], rows: rows.slice(1) };
+            }
+            return { headers, rows };
+        }
+
+        function chartToData(spec) {
+            const headers = ['Label', ...spec.datasets.map((d, i) => d.label || `Series ${i + 1}`)];
+            const rows = spec.labels.map((label, i) => [
+                label, ...spec.datasets.map(d => d.data[i])
+            ]);
+            return { headers, rows };
+        }
+
+        // ── Downloads ──────────────────────────────────────────────────────
+        async function downloadTable(fmt, data, title) {
+            try {
+                const res = await fetch(`/export/${fmt}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ...data, title: title || 'salai-export' })
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    showToast(err.message || `Export failed (HTTP ${res.status})`, 'error');
+                    return;
+                }
+                const blob = await res.blob();
+                const name = (res.headers.get('Content-Disposition') || '')
+                    .match(/filename="([^"]+)"/);
+                triggerDownload(blob, name ? name[1] : `export.${fmt}`);
+                showToast(`Downloaded ${fmt.toUpperCase()}`, 'success');
+            } catch (e) {
+                showToast('Export request failed', 'error');
+            }
+        }
+
+        function triggerDownload(blob, filename) {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            // Revoke on the next tick so Safari has time to start the download.
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+
+        function copyText(text, label) {
+            const done = () => showToast(`${label} copied`, 'success');
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(done,
+                    () => showToast('Could not copy', 'error'));
+                return;
+            }
+            // http://localhost has no clipboard API in some browsers.
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); done(); }
+            catch (e) { showToast('Could not copy', 'error'); }
+            ta.remove();
+        }
+
+        function makeBtn(icon, label, onClick, title) {
+            const b = document.createElement('button');
+            b.className = 'output-btn';
+            b.innerHTML = `<i class="fas ${icon}"></i>`;
+            b.appendChild(document.createTextNode(' ' + label));
+            if (title) b.title = title;
+            b.addEventListener('click', onClick);
+            return b;
+        }
+
+        // PDF via the browser's print pipeline: it reproduces the rendered
+        // Markdown, tables and canvas charts exactly as shown. A server-side
+        // text-only PDF would not, and the good HTML->PDF engines are heavy
+        // native dependencies on Windows.
+        function printMessage(messageEl) {
+            const all = Array.from(chat.querySelectorAll('.message'));
+            all.forEach(m => { if (m !== messageEl) m.classList.add('print-hide'); });
+            const cleanup = () => {
+                all.forEach(m => m.classList.remove('print-hide'));
+                window.removeEventListener('afterprint', cleanup);
+            };
+            window.addEventListener('afterprint', cleanup);
+            window.print();
+            // Fallback for browsers that never fire afterprint.
+            setTimeout(cleanup, 60000);
+        }
+
+        function addChartActions(wrap, spec, canvas) {
+            const bar = document.createElement('div');
+            bar.className = 'output-actions';
+            const data = chartToData(spec);
+            const title = spec.title || 'chart';
+
+            bar.appendChild(makeBtn('fa-image', 'PNG', () => {
+                canvas.toBlob(blob => {
+                    if (blob) triggerDownload(blob, `${title.replace(/\s+/g, '_')}.png`);
+                    else showToast('Could not render the image', 'error');
+                });
+            }, 'Download the chart as an image'));
+
+            bar.appendChild(makeBtn('fa-file-csv', 'CSV',
+                () => downloadTable('csv', data, title), 'Download the chart data'));
+            bar.appendChild(makeBtn('fa-file-excel', 'Excel',
+                () => downloadTable('xlsx', data, title), 'Download the chart data as .xlsx'));
+
+            wrap.appendChild(bar);
+        }
+
+        // One action row per message, plus a row per table it contains.
+        function addOutputActions(contentEl, rawMarkdown) {
+            const tables = Array.from(contentEl.querySelectorAll('table'));
+
+            tables.forEach((table, i) => {
+                const data = tableToData(table);
+                if (!data.rows.length) return;
+                const title = tables.length > 1 ? `table-${i + 1}` : 'table';
+                const bar = document.createElement('div');
+                bar.className = 'output-actions';
+                bar.appendChild(makeBtn('fa-file-csv', 'CSV',
+                    () => downloadTable('csv', data, title), 'Download this table as CSV'));
+                bar.appendChild(makeBtn('fa-file-excel', 'Excel',
+                    () => downloadTable('xlsx', data, title), 'Download this table as .xlsx'));
+                bar.appendChild(makeBtn('fa-clipboard', 'Copy TSV', () => {
+                    const tsv = [data.headers.join('\t'),
+                                 ...data.rows.map(r => r.join('\t'))].join('\n');
+                    copyText(tsv, 'Table');
+                }, 'Copy for pasting into Excel or Sheets'));
+                table.insertAdjacentElement('afterend', bar);
+            });
+
+            const bar = document.createElement('div');
+            bar.className = 'output-actions';
+            bar.appendChild(makeBtn('fa-file-pdf', 'PDF',
+                () => printMessage(contentEl.closest('.message')),
+                'Open the print dialog — choose "Save as PDF"'));
+            bar.appendChild(makeBtn('fa-clipboard', 'Copy',
+                () => copyText(rawMarkdown, 'Answer'), 'Copy the raw Markdown'));
+            contentEl.appendChild(bar);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Settings: provider, model, credentials, output format
+        // ═══════════════════════════════════════════════════════════════
+
+        let settingsState = null;   // last /settings payload
+        let currentFormat = 'auto';
+
+        function providerSpec(id) {
+            if (!settingsState) return null;
+            return settingsState.providers.find(p => p.id === id) || null;
+        }
+
+        function loadSettings() {
+            return fetch('/settings')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status !== 'success') return;
+                    settingsState = data;
+                    currentFormat = data.settings.output_format;
+                    renderFormatBar();
+                    renderModelPill();
+                })
+                .catch(() => showToast('Could not load settings', 'error'));
+        }
+
+        function renderModelPill() {
+            const pill = document.getElementById('modelPill');
+            if (!settingsState) { pill.textContent = '…'; return; }
+            const s = settingsState.settings;
+            const spec = providerSpec(s.provider);
+            pill.textContent = `${spec ? spec.label : s.provider} · ${s.model}`;
+            // Flag the case where chatting will fail until a key is entered.
+            if (s.needs_key && !s.has_key) {
+                pill.textContent += ' · no key';
+                pill.style.background = 'rgba(255,80,80,0.35)';
+            } else {
+                pill.style.background = 'rgba(255,255,255,0.2)';
+            }
+        }
+
+        function renderFormatBar() {
+            const bar = document.getElementById('formatBar');
+            bar.textContent = '';
+            const label = document.createElement('span');
+            label.className = 'format-bar-label';
+            label.textContent = 'Format';
+            bar.appendChild(label);
+
+            const formats = settingsState ? settingsState.output_formats : { auto: { label: 'Auto' } };
+            Object.entries(formats).forEach(([id, meta]) => {
+                const chip = document.createElement('button');
+                chip.className = 'format-chip' + (id === currentFormat ? ' active' : '');
+                chip.textContent = meta.label;
+                chip.title = meta.hint || '';
+                chip.addEventListener('click', () => setFormat(id));
+                bar.appendChild(chip);
+            });
+        }
+
+        function setFormat(id) {
+            currentFormat = id;
+            renderFormatBar();
+            patchSettings({ output_format: id }, false).then(() => {
+                const meta = settingsState.output_formats[id];
+                showToast(`Answers will use: ${meta.label}`, 'info');
+            });
+        }
+
+        function patchSettings(changes, notify = true) {
+            return fetch('/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(changes)
+            })
+                .then(r => r.json().then(data => ({ ok: r.ok, data })))
+                .then(({ ok, data }) => {
+                    if (!ok || data.status !== 'success') {
+                        showToast(data.message || 'Could not save settings', 'error');
+                        return null;
+                    }
+                    settingsState = data;
+                    currentFormat = data.settings.output_format;
+                    renderModelPill();
+                    if (notify) showToast('Settings saved', 'success');
+                    return data;
+                })
+                .catch(() => { showToast('Settings request failed', 'error'); return null; });
+        }
+
+        // ── Modal ──────────────────────────────────────────────────────────
+        function openSettings() {
+            const show = () => {
+                populateSettingsForm();
+                document.getElementById('settingsModal').classList.add('open');
+            };
+            if (settingsState) show(); else loadSettings().then(show);
+        }
+
+        function closeSettings() {
+            document.getElementById('settingsModal').classList.remove('open');
+        }
+
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') closeSettings();
+        });
+
+        function populateSettingsForm() {
+            if (!settingsState) return;
+            const s = settingsState.settings;
+
+            const select = document.getElementById('providerSelect');
+            select.textContent = '';
+            settingsState.providers.forEach(p => {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.textContent = p.label;
+                if (p.id === s.provider) opt.selected = true;
+                select.appendChild(opt);
+            });
+
+            document.getElementById('modelInput').value = s.model || '';
+            document.getElementById('baseUrlInput').value = s.base_url || '';
+            document.getElementById('temperatureInput').value = s.temperature;
+            document.getElementById('maxTokensInput').value = s.max_tokens;
+            document.getElementById('apiKeyInput').value = '';
+
+            applyProviderVisibility(s.provider);
+        }
+
+        function applyProviderVisibility(providerId) {
+            const spec = providerSpec(providerId);
+            if (!spec) return;
+
+            document.getElementById('providerNote').textContent = spec.description;
+
+            document.getElementById('apiKeyField').style.display =
+                spec.needs_key ? 'block' : 'none';
+            document.getElementById('baseUrlField').style.display =
+                spec.editable_base_url ? 'block' : 'none';
+            document.getElementById('fetchModelsBtn').style.display =
+                spec.can_list_models ? 'flex' : 'none';
+
+            const link = document.getElementById('keyLink');
+            if (spec.key_url) {
+                link.href = spec.key_url;
+                link.style.display = 'inline';
+            } else {
+                link.style.display = 'none';
+            }
+
+            const status = document.getElementById('keyStatus');
+            const masked = settingsState.saved_keys[providerId];
+            if (masked) {
+                status.innerHTML = `<span class="key-status set">Key stored: ${masked}</span>`;
+            } else if (spec.needs_key) {
+                status.innerHTML = '<span class="key-status unset">No key stored</span>';
+            } else {
+                status.textContent = '';
+            }
+
+            setModelOptions(spec.models);
+        }
+
+        function setModelOptions(models) {
+            const list = document.getElementById('modelOptions');
+            list.textContent = '';
+            (models || []).forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                list.appendChild(opt);
+            });
+        }
+
+        function onProviderChange() {
+            const providerId = document.getElementById('providerSelect').value;
+            const spec = providerSpec(providerId);
+            if (!spec) return;
+            // Show that provider's defaults immediately; the server does the
+            // same reset when the change is saved.
+            document.getElementById('modelInput').value = spec.default_model;
+            document.getElementById('baseUrlInput').value = spec.base_url;
+            applyProviderVisibility(providerId);
+        }
+
+        function collectSettingsForm() {
+            const changes = {
+                provider: document.getElementById('providerSelect').value,
+                model: document.getElementById('modelInput').value.trim(),
+                base_url: document.getElementById('baseUrlInput').value.trim(),
+                temperature: parseFloat(document.getElementById('temperatureInput').value),
+                max_tokens: parseInt(document.getElementById('maxTokensInput').value, 10),
+                output_format: currentFormat
+            };
+            const key = document.getElementById('apiKeyInput').value.trim();
+            if (key) changes.api_key = key;
+            return changes;
+        }
+
+        function saveSettings() {
+            const btn = document.getElementById('saveSettingsBtn');
+            btn.disabled = true;
+            patchSettings(collectSettingsForm()).then(data => {
+                btn.disabled = false;
+                if (data) {
+                    document.getElementById('apiKeyInput').value = '';
+                    populateSettingsForm();
+                    closeSettings();
+                }
+            });
+        }
+
+        function resetSettings() {
+            if (!confirm('Reset provider settings and forget every stored API key?')) return;
+            fetch('/settings/reset', { method: 'POST' })
+                .then(r => r.json())
+                .then(() => loadSettings())
+                .then(() => { populateSettingsForm(); showToast('Settings reset', 'success'); })
+                .catch(() => showToast('Could not reset settings', 'error'));
+        }
+
+        function clearApiKey() {
+            const providerId = document.getElementById('providerSelect').value;
+            fetch(`/settings/key?provider=${encodeURIComponent(providerId)}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    showToast(data.message || 'Key cleared', 'success');
+                    document.getElementById('apiKeyInput').value = '';
+                    return loadSettings();
+                })
+                .then(() => populateSettingsForm())
+                .catch(() => showToast('Could not clear the key', 'error'));
+        }
+
+        // Saving first means the key is available to the provider call.
+        async function fetchModels() {
+            const btn = document.getElementById('fetchModelsBtn');
+            btn.disabled = true;
+            const saved = await patchSettings(collectSettingsForm(), false);
+            if (!saved) { btn.disabled = false; return; }
+            document.getElementById('apiKeyInput').value = '';
+
+            const providerId = document.getElementById('providerSelect').value;
+            try {
+                const res = await fetch(`/settings/models?provider=${encodeURIComponent(providerId)}`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    setModelOptions(data.models);
+                    showToast(`${data.models.length} models available`, 'success');
+                } else {
+                    showToast(data.message || 'Could not list models', 'error');
+                }
+            } catch (e) {
+                showToast('Model list request failed', 'error');
+            }
+            populateSettingsForm();
+            btn.disabled = false;
+        }
+
+        async function testConnection() {
+            const btn = document.getElementById('testBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span> Testing…';
+
+            const saved = await patchSettings(collectSettingsForm(), false);
+            if (saved) document.getElementById('apiKeyInput').value = '';
+
+            try {
+                const res = await fetch('/settings/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({})
+                });
+                const data = await res.json();
+                showToast(data.message || 'Test finished',
+                          data.status === 'success' ? 'success' : 'error');
+            } catch (e) {
+                showToast('Test request failed', 'error');
+            }
+            populateSettingsForm();
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fas fa-plug"></i> Test';
+        }
+
+        loadSettings();
 
         // Show what this chat already has as soon as the page loads.
         loadChatContext();

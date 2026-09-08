@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Salai - Flask + SocketIO chat over Azure OpenAI (via the Dentsu APIM gateway).
+"""Salai - Flask + SocketIO chat with pluggable LLM providers.
 
 Two tiers of context, deliberately separate:
 
@@ -10,6 +10,12 @@ Two tiers of context, deliberately separate:
 * **Chat context** (``/chat/*``, no admin key) -- files a user attaches to
   their own conversation. Held in memory, injected into the prompt verbatim,
   and discarded when the session ends. Lives in ``chat_store.py``.
+
+Two session identities, also deliberately separate:
+
+* ``chat_id`` -- rotates on "New chat"; keys history and attachments.
+* ``user_id`` -- stable for the browser; keys provider settings and API keys,
+  which must survive starting a new conversation.
 """
 import functools
 import hmac
@@ -21,8 +27,7 @@ import time
 import uuid
 from typing import Any, Dict, Optional, Tuple
 
-import requests
-from flask import Flask, jsonify, render_template, request, session
+from flask import Flask, Response, jsonify, render_template, request, session
 from flask_socketio import SocketIO, emit
 
 # Load environment before importing modules that read it at import time.
@@ -30,8 +35,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import exporters  # noqa: E402
+import providers  # noqa: E402
 from chat_store import chat_store  # noqa: E402
 from knowledge_base import SUPPORTED_EXTENSIONS, kb  # noqa: E402
+from settings_store import OUTPUT_FORMATS, settings_store  # noqa: E402
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -39,14 +47,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-REQUIRED_VARS = [
-    "AZURE_OPENAI_API_KEY",
-    "AZURE_OPENAI_ENDPOINT",
-    "AZURE_OPENAI_DEPLOYMENT_NAME",
-    "AZURE_OPENAI_API_VERSION",
-    "SECRET_KEY",
-    "ADMIN_API_KEY",
-]
+# Only these are needed to boot. Provider credentials are no longer required:
+# a user can supply their own key for OpenAI/Anthropic/OpenRouter in Settings,
+# so demanding the dentsu gateway's config up front would block that.
+REQUIRED_VARS = ["SECRET_KEY", "ADMIN_API_KEY"]
 
 missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
 if missing:
@@ -55,8 +59,22 @@ if missing:
         "Copy .env.example to .env and fill it in."
     )
 
+# Needed only for the built-in "dentsu Azure OpenAI" provider.
+DENTSU_VARS = [
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_DEPLOYMENT_NAME",
+    "AZURE_OPENAI_API_VERSION",
+]
+DENTSU_CONFIGURED = all(os.getenv(v) for v in DENTSU_VARS)
+if not DENTSU_CONFIGURED:
+    logger.warning(
+        "The dentsu gateway provider is unavailable (missing %s). Users must "
+        "choose another provider and supply a key in Settings.",
+        ", ".join(v for v in DENTSU_VARS if not os.getenv(v)),
+    )
+
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 50 * 1024 * 1024))
-REQUEST_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS", 60))
 
 SYSTEM_BASE = (
     "You are Salai, a helpful AI assistant for dentsu staff. "
@@ -148,10 +166,29 @@ def current_chat_id() -> str:
     return chat_id
 
 
+def current_user_id() -> str:
+    """Stable id for this browser, independent of the current conversation.
+
+    Provider settings and API keys hang off this rather than ``chat_id`` so that
+    starting a new chat does not wipe the user's configuration.
+    """
+    user_id = session.get("user_id")
+    if user_id:
+        return user_id
+    sid = getattr(request, "sid", None)
+    if sid:
+        return f"sid:{sid}"
+    user_id = uuid.uuid4().hex
+    session["user_id"] = user_id
+    return user_id
+
+
 # ─── prompt assembly ──────────────────────────────────────────────────────────
 
 
-def build_messages(chat_id: str, user_input: str) -> Tuple[list, Dict[str, Any]]:
+def build_messages(
+    chat_id: str, user_input: str, user_id: Optional[str] = None
+) -> Tuple[list, Dict[str, Any]]:
     """Compose the request payload for one turn.
 
     Context goes in the system message *only*. The user's message stays
@@ -159,9 +196,23 @@ def build_messages(chat_id: str, user_input: str) -> Tuple[list, Dict[str, Any]]
     user turn *and* repeated them in the system message, which doubled token
     cost and left the model unable to tell instructions from data.
     """
-    meta: Dict[str, Any] = {"kb_status": "skipped", "kb_sources": [], "chat_files": 0}
+    meta: Dict[str, Any] = {
+        "kb_status": "skipped",
+        "kb_sources": [],
+        "chat_files": 0,
+        "output_format": "auto",
+    }
 
     system_parts = [SYSTEM_BASE]
+
+    # The chosen output shape is an instruction, so it belongs with the other
+    # system-level directives rather than tacked onto the user's message.
+    if user_id:
+        fmt = settings_store.get(user_id)["output_format"]
+        meta["output_format"] = fmt
+        instruction = OUTPUT_FORMATS.get(fmt, {}).get("instruction", "")
+        if instruction:
+            system_parts.append("## Requested output format\n" + instruction)
 
     result = kb.query(user_input)
     meta["kb_status"] = result["status"]
@@ -197,60 +248,43 @@ def build_messages(chat_id: str, user_input: str) -> Tuple[list, Dict[str, Any]]
     return messages, meta
 
 
-def get_answer(user_input: str, chat_id: str) -> str:
+def get_answer(user_input: str, chat_id: str, user_id: str) -> str:
     """Run one conversation turn and persist it to the chat's history."""
     user_input = (user_input or "").strip()
     if not user_input:
         return "Please enter a question."
 
-    messages, meta = build_messages(chat_id, user_input)
+    messages, meta = build_messages(chat_id, user_input, user_id)
+    settings = settings_store.get(user_id)
+    provider_id = settings["provider"]
+
     logger.info(
-        "[chat %s] kb=%s sources=%s attached=%d history=%d",
+        "[chat %s] provider=%s model=%s format=%s kb=%s sources=%s attached=%d history=%d",
         chat_id[:8],
+        provider_id,
+        settings["model"],
+        meta["output_format"],
         meta["kb_status"],
         meta["kb_sources"] or "-",
         meta["chat_files"],
         len(messages) - 2,
     )
 
-    endpoint = (
-        f"{os.getenv('AZURE_OPENAI_ENDPOINT').rstrip('/')}/openai/deployments/"
-        f"{os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME')}/chat/completions"
-        f"?api-version={os.getenv('AZURE_OPENAI_API_VERSION')}"
-    )
-    headers = {
-        "x-brand": os.getenv("API_BRAND", "dentsu"),
-        "x-service-line": os.getenv("API_SERVICE_LINE", "Functions"),
-        "x-project": os.getenv("API_PROJECT", "test"),
-        "Ocp-Apim-Subscription-Key": os.getenv("AZURE_OPENAI_API_KEY"),
-        "api-version": os.getenv("API_GATEWAY_VERSION", "v15"),
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messages": messages,
-        "temperature": float(os.getenv("LLM_TEMPERATURE", 0.7)),
-        "max_completion_tokens": int(os.getenv("LLM_MAX_TOKENS", 2000)),
-    }
-
     try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-    except requests.exceptions.Timeout:
-        logger.error("LLM request timed out after %ds", REQUEST_TIMEOUT)
-        return "The request timed out. Please try again."
-    except requests.exceptions.RequestException as e:
-        logger.error("LLM network error: %s", e)
-        return "I could not reach the language model. Please check your connection and retry."
-
-    if response.status_code != 200:
-        # Never surface the raw gateway body: it can echo request headers.
-        logger.error("LLM API error %s: %s", response.status_code, response.text[:500])
-        return f"The language model returned an error (HTTP {response.status_code}). Please try again."
-
-    try:
-        answer = response.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, ValueError) as e:
-        logger.error("Unexpected LLM response shape: %s", e)
-        return "I received an unexpected response from the language model."
+        answer = providers.chat(
+            provider_id,
+            settings["model"],
+            messages,
+            api_key=settings_store.api_key(user_id, provider_id),
+            base_url=settings["base_url"],
+            temperature=settings["temperature"],
+            max_tokens=settings["max_tokens"],
+        )
+    except providers.ProviderError as e:
+        # These messages are written to be shown to the user, and the provider
+        # layer keeps raw response bodies (which can echo the API key) out.
+        logger.error("[chat %s] provider %s failed: %s", chat_id[:8], provider_id, e)
+        return f"⚠️ {e}"
 
     # Record both sides of the turn. The old code stored only the assistant
     # message, which produced a malformed, assistant-only "conversation".
@@ -264,10 +298,12 @@ def get_answer(user_input: str, chat_id: str) -> str:
 
 @app.route("/")
 def index():
-    # Establish the chat id here, where setting a cookie actually works.
+    # Establish both ids here, where setting a cookie actually works.
     if "chat_id" not in session:
         session["chat_id"] = uuid.uuid4().hex
         session.permanent = False
+    if "user_id" not in session:
+        session["user_id"] = uuid.uuid4().hex
     return render_template("index.html")
 
 
@@ -553,13 +589,149 @@ def chat_status():
 def handle_voice_command(data):
     command = (data or {}).get("command", "")
     chat_id = current_chat_id()
+    user_id = current_user_id()
     logger.info("[chat %s] received: %.80s", chat_id[:8], command)
     try:
-        response = get_answer(command, chat_id)
+        response = get_answer(command, chat_id, user_id)
     except Exception:
         logger.exception("Unhandled error answering a message")
         response = "Something went wrong handling that message. Please try again."
     emit("response", {"result": response, "command": command})
+
+
+# ─── settings: provider, model, credentials, output format ────────────────────
+
+
+@app.route("/settings", methods=["GET"])
+def get_settings():
+    """Current configuration plus the provider catalogue. No raw keys."""
+    return jsonify(status="success", **settings_store.public_state(current_user_id()))
+
+
+@app.route("/settings", methods=["POST"])
+def update_settings():
+    """Patch settings. An `api_key` here is stored in memory only."""
+    changes = request.get_json(silent=True) or {}
+    if not isinstance(changes, dict):
+        return jsonify(status="error", message="Expected a JSON object"), 400
+
+    allowed = {
+        "provider",
+        "model",
+        "base_url",
+        "temperature",
+        "max_tokens",
+        "output_format",
+        "api_key",
+    }
+    unknown = set(changes) - allowed
+    if unknown:
+        return jsonify(
+            status="error", message=f"Unknown setting(s): {', '.join(sorted(unknown))}"
+        ), 400
+
+    result = settings_store.update(current_user_id(), changes)
+    return jsonify(result), 200 if result["status"] == "success" else 400
+
+
+@app.route("/settings/models", methods=["GET"])
+def settings_models():
+    """Ask the selected provider which models it actually serves."""
+    user_id = current_user_id()
+    settings = settings_store.get(user_id)
+    provider_id = request.args.get("provider") or settings["provider"]
+    try:
+        models = providers.list_models(
+            provider_id,
+            api_key=settings_store.api_key(user_id, provider_id),
+            base_url=request.args.get("base_url") or settings["base_url"],
+        )
+    except providers.ProviderError as e:
+        return jsonify(status="error", message=str(e)), 400
+    return jsonify(status="success", provider=provider_id, models=models)
+
+
+@app.route("/settings/test", methods=["POST"])
+def settings_test():
+    """Round-trip a one-word prompt so a key can be verified before chatting."""
+    user_id = current_user_id()
+    settings = settings_store.get(user_id)
+    body = request.get_json(silent=True) or {}
+    provider_id = body.get("provider") or settings["provider"]
+    result = providers.test_connection(
+        provider_id,
+        model=body.get("model") or (settings["model"] if provider_id == settings["provider"] else ""),
+        api_key=settings_store.api_key(user_id, provider_id),
+        base_url=body.get("base_url") or settings["base_url"],
+    )
+    return jsonify(result), 200 if result["status"] == "success" else 400
+
+
+@app.route("/settings/key", methods=["DELETE"])
+def settings_clear_key():
+    provider_id = request.args.get("provider")
+    if not provider_id:
+        return jsonify(status="error", message="Query parameter 'provider' is required"), 400
+    return jsonify(settings_store.clear_key(current_user_id(), provider_id))
+
+
+@app.route("/settings/reset", methods=["POST"])
+def settings_reset():
+    """Forget settings and every stored key for this browser."""
+    return jsonify(settings_store.reset(current_user_id()))
+
+
+# ─── output: exports and image generation ─────────────────────────────────────
+
+
+@app.route("/export/<fmt>", methods=["POST"])
+def export(fmt):
+    """Convert a table the browser scraped from an answer into CSV or XLSX."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        data, mimetype, filename = exporters.build(fmt.lower(), payload)
+    except exporters.ExportError as e:
+        return jsonify(status="error", message=str(e)), 400
+
+    logger.info("Export %s: %s (%d bytes)", fmt, filename, len(data))
+    return Response(
+        data,
+        mimetype=mimetype,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(data)),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.route("/generate/image", methods=["POST"])
+def generate_image():
+    """Generate an image with the user's own provider.
+
+    Not possible on the dentsu gateway, which rejects every non-chat model --
+    the provider layer returns a clear message pointing at Settings.
+    """
+    user_id = current_user_id()
+    settings = settings_store.get(user_id)
+    body = request.get_json(silent=True) or {}
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify(status="error", message="A prompt is required"), 400
+
+    provider_id = settings["provider"]
+    try:
+        result = providers.generate_image(
+            provider_id,
+            prompt,
+            api_key=settings_store.api_key(user_id, provider_id),
+            base_url=settings["base_url"],
+            model=body.get("model") or "gpt-image-1",
+            size=body.get("size") or "1024x1024",
+        )
+    except providers.ProviderError as e:
+        return jsonify(status="error", message=str(e)), 400
+    return jsonify(status="success", **result)
 
 
 if __name__ == "__main__":

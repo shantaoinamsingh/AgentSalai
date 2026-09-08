@@ -24,5 +24,13 @@ onnxruntime==1.20.1
 PyPDF2==3.0.1
 python-docx==1.2.0
 
+# Excel export (CSV needs nothing; PDF is produced by the browser's print
+# pipeline so it matches the rendered answer without a native HTML->PDF engine).
+openpyxl==3.1.5
+
+# Optional: only needed for the "Anthropic (Claude)" provider. The OpenAI,
+# OpenRouter and self-hosted providers are plain HTTP and need nothing extra.
+anthropic==0.107.1
+
 # Tests
 pytest==9.0.3
