@@ -1,0 +1,1120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Salai - AI Chat Assistant</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 1rem;
+            color: white;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            font-weight: 300;
+        }
+
+        /* Right-hand header actions: organisation context + new chat. */
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .header-btn {
+            background: rgba(255, 255, 255, 0.15);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            color: white;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-family: inherit;
+            padding: 0.5rem 0.9rem;
+            border-radius: 20px;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+        .header-btn:hover { background: rgba(255, 255, 255, 0.3); }
+        .header-btn.active {
+            background: white;
+            color: #667eea;
+            border-color: white;
+        }
+
+        .chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            max-width: 800px;
+            margin: 0 auto;
+            width: 100%;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 10px;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+
+        #chat {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .message {
+            display: flex;
+            margin-bottom: 1rem;
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        .message.user {
+            justify-content: flex-end;
+        }
+
+        .message.bot {
+            justify-content: flex-start;
+        }
+
+        .message-content {
+            max-width: 70%;
+            padding: 0.75rem 1rem;
+            border-radius: 18px;
+            position: relative;
+            word-wrap: break-word;
+        }
+
+        .message.user .message-content {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.bot .message-content {
+            background: #f1f3f4;
+            color: #333;
+            border-bottom-left-radius: 4px;
+        }
+
+        .avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            margin: 0 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+        }
+
+        .user .avatar {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            order: 2;
+        }
+
+        .bot .avatar {
+            background: #e8f5e8;
+            color: #4caf50;
+        }
+
+        .input-area {
+            border-top: 1px solid #e0e0e0;
+            padding: 1rem;
+            background: white;
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        #message {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            border: 2px solid #e0e0e0;
+            border-radius: 25px;
+            outline: none;
+            font-size: 1rem;
+            transition: border-color 0.3s;
+        }
+
+        #message:focus {
+            border-color: #667eea;
+        }
+
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn-secondary {
+            background: #f5f5f5;
+            color: #666;
+        }
+
+        .btn-secondary:hover {
+            background: #e0e0e0;
+        }
+
+        .typing {
+            display: none;
+            padding: 0.5rem 1rem;
+            color: #666;
+            font-style: italic;
+        }
+
+        .code-block {
+            background: #f6f8fa;
+            border: 1px solid #e1e4e8;
+            border-radius: 6px;
+            padding: 1rem;
+            margin: 0.5rem 0;
+            overflow-x: auto;
+        }
+
+        .code-block code {
+            background: none;
+            padding: 0;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* ─── Attach to this chat ───────────────────────────────────────── */
+        /* A plain icon button beside Send: pick files, they attach straight
+           to the current conversation. No admin key, nothing persisted. */
+        .attach-btn {
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            font-size: 1.15rem;
+            color: #888;
+            padding: 0.7rem;
+            border-radius: 50%;
+            width: 2.9rem;
+            height: 2.9rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            position: relative;
+        }
+        .attach-btn:hover { background: rgba(102,126,234,0.12); color: #667eea; }
+        .attach-btn:disabled { opacity: 0.5; cursor: default; }
+        .attach-btn.has-files { color: #667eea; }
+
+        /* Count bubble on the paperclip when files are attached. */
+        .attach-count {
+            position: absolute;
+            top: 2px;
+            right: 2px;
+            background: #667eea;
+            color: white;
+            font-size: 0.62rem;
+            font-weight: 600;
+            min-width: 15px;
+            height: 15px;
+            border-radius: 8px;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 0 3px;
+        }
+        .attach-count.visible { display: flex; }
+
+        /* Strip of attached-file chips, directly above the input row. */
+        .attachment-strip {
+            display: none;
+            flex-wrap: wrap;
+            gap: 0.4rem;
+            padding: 0.6rem 1rem 0;
+            background: white;
+            align-items: center;
+        }
+        .attachment-strip.visible { display: flex; }
+
+        .attachment-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            background: rgba(102,126,234,0.1);
+            border: 1px solid rgba(102,126,234,0.25);
+            color: #4a4a6a;
+            border-radius: 14px;
+            padding: 0.25rem 0.6rem;
+            font-size: 0.78rem;
+            max-width: 260px;
+        }
+        .attachment-chip .chip-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .attachment-chip .chip-size { color: #888; font-size: 0.7rem; flex-shrink: 0; }
+        .attachment-chip .chip-remove {
+            cursor: pointer;
+            color: #999;
+            flex-shrink: 0;
+            padding: 0 2px;
+        }
+        .attachment-chip .chip-remove:hover { color: #e53935; }
+        .attachment-chip.uploading { opacity: 0.6; }
+        .attachment-hint {
+            font-size: 0.72rem;
+            color: #999;
+            width: 100%;
+        }
+
+        /* ─── Context Panel ─────────────────────────────────────────────── */
+        .context-panel {
+            display: none;
+            /* Sits at the top of the container now that its toggle is in the
+               header, so the divider belongs on the bottom edge. */
+            border-bottom: 1px solid #e0e0e0;
+            padding: 1rem;
+            background: #fafafa;
+            max-height: 420px;
+            overflow-y: auto;
+        }
+        .context-panel.open { display: block; animation: slideDown 0.25s ease-out; }
+        @keyframes slideDown {
+            from { opacity: 0; transform: translateY(-8px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .context-section { margin-bottom: 1rem; }
+        .context-section-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+        }
+        .api-key-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 1rem; }
+        .api-key-row input {
+            flex: 1;
+            padding: 0.5rem 0.75rem;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            outline: none;
+        }
+        .api-key-row input:focus { border-color: #667eea; }
+        .drop-zone {
+            border: 2px dashed #ccc;
+            border-radius: 12px;
+            padding: 1.5rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            background: white;
+            margin-bottom: 0.75rem;
+        }
+        .drop-zone:hover, .drop-zone.drag-over {
+            border-color: #667eea;
+            background: rgba(102,126,234,0.05);
+        }
+        .drop-zone input[type="file"] { display: none; }
+        .drop-zone-text { color: #888; font-size: 0.9rem; }
+        .drop-zone-text i { font-size: 1.5rem; color: #ccc; margin-bottom: 0.5rem; display: block; }
+        .selected-files { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.75rem; }
+        .file-chip {
+            background: #f1f3f4;
+            border-radius: 20px;
+            padding: 0.25rem 0.75rem;
+            font-size: 0.82rem;
+            color: #555;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+        .file-chip i { color: #667eea; }
+        .indexed-files {
+            background: white;
+            border-radius: 10px;
+            border: 1px solid #e8e8e8;
+            overflow: hidden;
+        }
+        .indexed-file-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.6rem 0.9rem;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 0.88rem;
+        }
+        .indexed-file-item:last-child { border-bottom: none; }
+        .indexed-file-info { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+        .indexed-file-info .filename {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 200px;
+        }
+        .indexed-file-info .chunk-count {
+            background: #e8f5e9;
+            color: #2e7d32;
+            border-radius: 10px;
+            padding: 0.1rem 0.5rem;
+            font-size: 0.75rem;
+            white-space: nowrap;
+        }
+        .delete-file-btn {
+            background: none;
+            border: none;
+            color: #ccc;
+            cursor: pointer;
+            padding: 0.2rem;
+            font-size: 0.85rem;
+            transition: color 0.2s;
+            border-radius: 4px;
+        }
+        .delete-file-btn:hover { color: #e53935; background: #ffebee; }
+        .context-status-bar {
+            display: flex;
+            gap: 1rem;
+            padding: 0.6rem 0;
+            font-size: 0.82rem;
+            color: #888;
+        }
+        .context-status-bar .badge { background: #f1f3f4; border-radius: 8px; padding: 0.2rem 0.6rem; }
+        .context-loading { display: inline-flex; align-items: center; gap: 0.5rem; color: #888; font-size: 0.85rem; }
+        .spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid #e0e0e0;
+            border-top-color: #667eea;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        .toast {
+            background: #333;
+            color: white;
+            padding: 0.75rem 1.2rem;
+            border-radius: 10px;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            animation: toastIn 0.3s ease;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+        .toast.success { background: #2e7d32; }
+        .toast.error   { background: #c62828; }
+        .toast.info    { background: #1565c0; }
+        @keyframes toastIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        @media (max-width: 768px) {
+            .chat-container { margin: 0.5rem; margin-top: 1rem; }
+            .message-content { max-width: 85%; }
+            .input-area { padding: 0.75rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><i class="fas fa-robot"></i> Salai</h1>
+        <div class="header-actions">
+            <button class="header-btn" onclick="startNewChat()" title="Clear this conversation and its attachments">
+                <i class="fas fa-rotate-left"></i>
+                <span>New chat</span>
+            </button>
+            <button class="header-btn" id="contextToggle" onclick="toggleContextPanel()"
+                    title="Organisation knowledge base (admin)">
+                <i class="fas fa-database"></i>
+                <span>Context</span>
+            </button>
+        </div>
+    </div>
+
+    <div class="chat-container">
+        <!-- Panel opens from the top, under its header button. -->
+        <div class="context-panel" id="contextPanel">
+            <div class="context-section">
+                <div class="context-section-title">
+                    <i class="fas fa-building"></i> Organisation context
+                    <span class="badge" style="margin-left:6px">admin</span>
+                </div>
+                <div style="font-size:0.78rem;color:#888;margin-bottom:0.5rem;line-height:1.4">
+                    Indexed once and searched for everyone, in every chat. To use a document
+                    in just this conversation, use the
+                    <i class="fas fa-paperclip"></i> button next to Send instead.
+                </div>
+                <div class="api-key-row">
+                    <input type="password" id="adminApiKey" placeholder="Admin API key..." onkeydown="if(event.key==='Enter')loadContextStatus()">
+                    <button class="btn btn-secondary" onclick="loadContextStatus()" title="Unlock">
+                        <i class="fas fa-key"></i>
+                    </button>
+                </div>
+
+                <div id="adminArea" style="display:none;margin-top:0.75rem">
+                    <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+                        <input type="file" id="fileInput" multiple accept=".txt,.md,.csv,.pdf,.docx,.doc">
+                        <div class="drop-zone-text">
+                            <i class="fas fa-cloud-upload-alt"></i>
+                            Drag &amp; drop files here or click to browse<br>
+                            <small style="color:#999">Indexed for the whole organisation</small>
+                        </div>
+                    </div>
+                    <div class="selected-files" id="selectedFiles"></div>
+                    <button class="btn btn-primary" style="width:100%" id="uploadBtn" onclick="uploadFiles()" disabled>
+                        <i class="fas fa-upload"></i> Upload &amp; Index
+                    </button>
+
+                    <div class="context-status-bar" id="contextStatusBar" style="margin-top:0.6rem">
+                        <span class="badge" id="fileCountBadge">0 files</span>
+                        <span class="badge" id="chunkCountBadge">0 chunks</span>
+                    </div>
+                    <div id="kbWarning" style="display:none;font-size:0.78rem;color:#c62828;margin:0.4rem 0;line-height:1.4"></div>
+                    <div class="indexed-files" id="indexedFiles">
+                        <div style="padding:1rem;text-align:center;color:#999;font-size:0.85rem;">
+                            No files indexed yet.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="chat">
+            <div class="message bot">
+                <div class="avatar"><i class="fas fa-robot"></i></div>
+                <div class="message-content">
+                    Hello! I'm Salai, your AI assistant. How can I help you today?
+                </div>
+            </div>
+        </div>
+
+        <div class="typing">Salai is typing...</div>
+
+        <!-- Files attached to this conversation. Populated from /chat/list_context. -->
+        <div class="attachment-strip" id="attachmentStrip"></div>
+
+        <div class="input-area">
+            <input type="text" id="message" placeholder="Type your message...">
+
+            <!-- Attach to this chat: one click, straight to the file picker. -->
+            <input type="file" id="chatFileInput" multiple
+                   accept=".txt,.md,.csv,.pdf,.docx,.doc" style="display:none">
+            <button class="attach-btn" id="attachBtn" onclick="document.getElementById('chatFileInput').click()"
+                    title="Attach a file to this chat">
+                <i class="fas fa-paperclip"></i>
+                <span class="attach-count" id="attachCount"></span>
+            </button>
+
+            <button class="btn btn-primary" onclick="sendMessage()">
+                <i class="fas fa-paper-plane"></i> Send
+            </button>
+            <button class="btn btn-secondary" onclick="startVoice()" title="Voice input">
+                <i class="fas fa-microphone"></i>
+            </button>
+        </div>
+
+    </div>
+
+    <!-- Toast notifications -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script>
+        const socket = io();
+        const chat = document.getElementById('chat');
+        const messageInput = document.getElementById('message');
+        const typingIndicator = document.querySelector('.typing');
+
+        marked.setOptions({
+            highlight: function(code, lang) {
+                if (lang && hljs.getLanguage(lang)) {
+                    return hljs.highlight(code, { language: lang }).value;
+                }
+                return hljs.highlightAuto(code).value;
+            },
+            breaks: true,
+            gfm: true
+        });
+
+        socket.on('response', function(data) {
+            hideTyping();
+            addMessage('bot', data.result, data.command);
+        });
+
+        function addMessage(type, content, originalCommand = '') {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${type}`;
+
+            const avatar = document.createElement('div');
+            avatar.className = 'avatar';
+            avatar.innerHTML = type === 'user' ? '<i class="fas fa-user"></i>' : '<i class="fas fa-robot"></i>';
+
+            const messageContent = document.createElement('div');
+            messageContent.className = 'message-content';
+
+            if (type === 'user') {
+                messageContent.textContent = originalCommand || content;
+            } else {
+                // Render markdown for bot messages
+                messageContent.innerHTML = marked.parse(content);
+                // Highlight code blocks
+                messageContent.querySelectorAll('pre code').forEach((block) => {
+                    hljs.highlightElement(block);
+                });
+            }
+
+            messageDiv.appendChild(avatar);
+            messageDiv.appendChild(messageContent);
+            chat.appendChild(messageDiv);
+
+            chat.scrollTop = chat.scrollHeight;
+        }
+
+        function sendMessage() {
+            const message = messageInput.value.trim();
+            if (message) {
+                addMessage('user', message);
+                showTyping();
+                socket.emit('voice_command', {command: message});
+                messageInput.value = '';
+            }
+        }
+
+        function showTyping() {
+            typingIndicator.style.display = 'block';
+        }
+
+        function hideTyping() {
+            typingIndicator.style.display = 'none';
+        }
+
+        function startVoice() {
+            // Voice recognition implementation
+            if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+                const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+                recognition.lang = 'en-US';
+                recognition.interimResults = false;
+
+                recognition.onstart = function() {
+                    messageInput.placeholder = 'Listening...';
+                };
+
+                recognition.onresult = function(event) {
+                    const transcript = event.results[0][0].transcript;
+                    messageInput.value = transcript;
+                    messageInput.placeholder = 'Type your message...';
+                    sendMessage();
+                };
+
+                recognition.onerror = function(event) {
+                    console.error('Speech recognition error:', event.error);
+                    messageInput.placeholder = 'Type your message...';
+                    alert('Voice recognition failed. Please try again.');
+                };
+
+                recognition.start();
+            } else {
+                alert('Voice recognition is not supported in your browser.');
+            }
+        }
+
+        messageInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        // Initialize highlight.js
+        hljs.highlightAll();
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Context Panel
+        //
+        //  Two independent tiers:
+        //    * chat  -> /chat/*   session-scoped, no key, injected verbatim
+        //    * admin -> /admin/*  org-wide, needs the admin key, embedded
+        // ═══════════════════════════════════════════════════════════════
+
+        let pendingFiles = [];      // staged for the org index
+        let chatPendingFiles = [];  // staged for this chat
+        let indexedDocs = [];
+
+        // ── Panel toggle ────────────────────────────────────────────────
+        function toggleContextPanel() {
+            const panel = document.getElementById('contextPanel');
+            const btn   = document.getElementById('contextToggle');
+            panel.classList.toggle('open');
+            btn.classList.toggle('active');
+            if (panel.classList.contains('open')) {
+                // Panel is admin-only now; chat attachments live by the input box.
+                const saved = sessionStorage.getItem('kai_admin_key');
+                if (saved) {
+                    document.getElementById('adminApiKey').value = saved;
+                    loadContextStatus();
+                }
+            }
+        }
+
+        // ── Toast notifications ─────────────────────────────────────────
+        function showToast(message, type) {
+            if (!type) type = 'info';
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            const icon = type === 'success' ? 'fa-check-circle' : type === 'error' ? 'fa-exclamation-circle' : 'fa-info-circle';
+            // Build via textContent so a filename in the message cannot inject markup.
+            const i = document.createElement('i');
+            i.className = `fas ${icon}`;
+            toast.appendChild(i);
+            toast.appendChild(document.createTextNode(' ' + message));
+            container.appendChild(toast);
+            setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 4000);
+        }
+
+        // ── Helpers ────────────────────────────────────────────────────
+        function getApiKey() {
+            return document.getElementById('adminApiKey').value.trim();
+        }
+
+        // The admin key goes in a header, never the query string, so it stays
+        // out of server access logs and browser history.
+        function adminFetch(path, options) {
+            const opts = options || {};
+            opts.headers = Object.assign({}, opts.headers, { 'X-API-Key': getApiKey() });
+            return fetch(path, opts);
+        }
+
+        function escHtml(str) {
+            const d = document.createElement('div');
+            d.textContent = str;
+            return d.innerHTML;
+        }
+        function fmtBytes(n) {
+            if (!n) return '0 B';
+            const u = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), u.length - 1);
+            return `${(n / Math.pow(1024, i)).toFixed(i ? 1 : 0)} ${u[i]}`;
+        }
+        function plural(n, word) {
+            return `${n} ${word}${n === 1 ? '' : 's'}`;
+        }
+
+        // Render a file list into a container, wiring delete buttons via
+        // addEventListener rather than inline onclick with an interpolated
+        // filename (which broke on quotes and was an injection risk).
+        function renderFileList(container, items, emptyMsg, onDelete) {
+            container.textContent = '';
+            if (items.length === 0) {
+                const empty = document.createElement('div');
+                empty.style.cssText = 'padding:1rem;text-align:center;color:#ccc;font-size:0.85rem;';
+                empty.textContent = emptyMsg;
+                container.appendChild(empty);
+                return;
+            }
+            items.forEach(item => {
+                const row = document.createElement('div');
+                row.className = 'indexed-file-item';
+
+                const info = document.createElement('div');
+                info.className = 'indexed-file-info';
+                info.innerHTML = '<i class="fas fa-file-alt" style="color:#667eea"></i>';
+
+                const name = document.createElement('span');
+                name.className = 'filename';
+                name.title = item.name;
+                name.textContent = item.name;
+                info.appendChild(name);
+
+                const meta = document.createElement('span');
+                meta.className = 'chunk-count';
+                meta.textContent = item.meta;
+                info.appendChild(meta);
+
+                const del = document.createElement('button');
+                del.className = 'delete-file-btn';
+                del.title = 'Remove';
+                del.innerHTML = '<i class="fas fa-trash-alt"></i>';
+                del.addEventListener('click', () => onDelete(item.name));
+
+                row.appendChild(info);
+                row.appendChild(del);
+                container.appendChild(row);
+            });
+        }
+
+        // Shared drag/drop + click wiring for a drop zone.
+        function wireDropZone(zoneId, inputId, onFiles) {
+            const zone = document.getElementById(zoneId);
+            const input = document.getElementById(inputId);
+            input.addEventListener('change', () => onFiles(Array.from(input.files)));
+            zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
+            zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+            zone.addEventListener('drop', e => {
+                e.preventDefault();
+                zone.classList.remove('drag-over');
+                onFiles(Array.from(e.dataTransfer.files));
+            });
+        }
+
+        function renderChips(containerId, btnId, files, onRemove) {
+            const container = document.getElementById(containerId);
+            const btn = document.getElementById(btnId);
+            container.textContent = '';
+            btn.disabled = files.length === 0;
+            files.forEach((f, i) => {
+                const chip = document.createElement('div');
+                chip.className = 'file-chip';
+                chip.innerHTML = '<i class="fas fa-file-alt"></i> ';
+                chip.appendChild(document.createTextNode(f.name));
+                const x = document.createElement('span');
+                x.style.cssText = 'cursor:pointer;margin-left:4px;font-size:0.7rem';
+                x.innerHTML = '&times;';
+                x.addEventListener('click', () => onRemove(i));
+                chip.appendChild(x);
+                container.appendChild(chip);
+            });
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Tier 1 - attachments for this conversation only
+        //
+        //  Driven by the paperclip beside Send: picking files uploads them
+        //  straight away, so there is no second "confirm" step to forget.
+        // ═══════════════════════════════════════════════════════════════
+
+        // Files currently mid-upload, shown as pending chips.
+        let uploadingNames = [];
+
+        function renderAttachmentStrip(files) {
+            const strip = document.getElementById('attachmentStrip');
+            const countBadge = document.getElementById('attachCount');
+            const attachBtn = document.getElementById('attachBtn');
+
+            strip.textContent = '';
+            const total = files.length + uploadingNames.length;
+
+            countBadge.textContent = total || '';
+            countBadge.classList.toggle('visible', total > 0);
+            attachBtn.classList.toggle('has-files', total > 0);
+            strip.classList.toggle('visible', total > 0);
+            if (total === 0) return;
+
+            files.forEach(f => {
+                const chip = document.createElement('div');
+                chip.className = 'attachment-chip';
+
+                const icon = document.createElement('i');
+                icon.className = 'fas fa-file-alt';
+                chip.appendChild(icon);
+
+                const name = document.createElement('span');
+                name.className = 'chip-name';
+                name.title = f.truncated
+                    ? `${f.filename} (truncated to fit the context limit)`
+                    : f.filename;
+                name.textContent = f.filename;
+                chip.appendChild(name);
+
+                const size = document.createElement('span');
+                size.className = 'chip-size';
+                size.textContent = f.truncated
+                    ? `${f.chars.toLocaleString()}c ✂`
+                    : `${f.chars.toLocaleString()}c`;
+                chip.appendChild(size);
+
+                const remove = document.createElement('span');
+                remove.className = 'chip-remove';
+                remove.innerHTML = '&times;';
+                remove.title = 'Remove from this chat';
+                remove.addEventListener('click', () => deleteChatFile(f.filename));
+                chip.appendChild(remove);
+
+                strip.appendChild(chip);
+            });
+
+            uploadingNames.forEach(n => {
+                const chip = document.createElement('div');
+                chip.className = 'attachment-chip uploading';
+                chip.innerHTML = '<span class="spinner"></span>';
+                const name = document.createElement('span');
+                name.className = 'chip-name';
+                name.textContent = n;
+                chip.appendChild(name);
+                strip.appendChild(chip);
+            });
+
+            const hint = document.createElement('div');
+            hint.className = 'attachment-hint';
+            hint.textContent = 'Used in this conversation only — not saved or shared.';
+            strip.appendChild(hint);
+        }
+
+        function loadChatContext() {
+            return fetch('/chat/list_context')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status !== 'success') return;
+                    renderAttachmentStrip(data.files || []);
+                })
+                .catch(() => showToast('Could not load this chat’s attachments', 'error'));
+        }
+
+        // Uploading starts the moment files are chosen.
+        document.getElementById('chatFileInput').addEventListener('change', function () {
+            const files = Array.from(this.files);
+            this.value = '';  // allow re-picking the same file later
+            if (files.length) attachToChat(files);
+        });
+
+        async function attachToChat(files) {
+            const attachBtn = document.getElementById('attachBtn');
+            attachBtn.disabled = true;
+
+            for (const file of files) {
+                uploadingNames.push(file.name);
+                await loadChatContext();  // repaint with the pending chip
+
+                const body = new FormData();
+                body.append('file', file);
+                try {
+                    const res = await fetch('/chat/upload_context', { method: 'POST', body });
+                    const data = await res.json();
+                    showToast(data.message || `${file.name} failed`,
+                              data.status === 'success' ? 'success' : 'error');
+                } catch (e) {
+                    showToast(`Could not attach ${file.name}`, 'error');
+                } finally {
+                    uploadingNames = uploadingNames.filter(n => n !== file.name);
+                }
+            }
+
+            attachBtn.disabled = false;
+            loadChatContext();
+        }
+
+        function deleteChatFile(filename) {
+            fetch(`/chat/delete_context?filename=${encodeURIComponent(filename)}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status !== 'success') showToast(data.message || 'Remove failed', 'error');
+                    loadChatContext();
+                })
+                .catch(() => showToast('Remove request failed', 'error'));
+        }
+
+        function startNewChat() {
+            if (!confirm('Start a new chat? This clears the conversation and any attached files.')) return;
+            fetch('/chat/new', { method: 'POST' })
+                .then(r => r.json())
+                .then(() => {
+                    chat.textContent = '';
+                    addMessage('bot', "Hello! I'm Salai, your AI assistant. How can I help you today?");
+                    uploadingNames = [];
+                    loadChatContext();
+                    showToast('Started a new chat', 'success');
+                })
+                .catch(() => showToast('Could not start a new chat', 'error'));
+        }
+        // ═══════════════════════════════════════════════════════════════
+        //  Tier 2 - organisation index (admin)
+        // ═══════════════════════════════════════════════════════════════
+
+        function loadContextStatus() {
+            const key = getApiKey();
+            if (!key) { showToast('Enter the admin API key first', 'error'); return; }
+
+            adminFetch('/admin/context_status')
+                .then(r => r.json().then(data => ({ ok: r.ok, data })))
+                .then(({ ok, data }) => {
+                    if (!ok) {
+                        document.getElementById('adminArea').style.display = 'none';
+                        sessionStorage.removeItem('kai_admin_key');
+                        showToast(data.message || 'Admin key rejected', 'error');
+                        return;
+                    }
+                    // Only remember the key once the server has accepted it.
+                    sessionStorage.setItem('kai_admin_key', key);
+                    document.getElementById('adminArea').style.display = 'block';
+
+                    document.getElementById('fileCountBadge').textContent = plural(data.total_files, 'file');
+                    document.getElementById('chunkCountBadge').textContent =
+                        `${plural(data.total_chunks, 'chunk')} · ${fmtBytes(data.storage_bytes)}`;
+
+                    const warn = document.getElementById('kbWarning');
+                    if (data.stale) {
+                        warn.style.display = 'block';
+                        warn.textContent = 'Index was built with a different embedding model, so '
+                            + 'search is disabled. Rebuild it with:  python manage_kb.py reindex';
+                    } else if (!data.ready) {
+                        warn.style.display = 'block';
+                        warn.textContent = data.init_error || 'Knowledge base unavailable.';
+                    } else {
+                        warn.style.display = 'none';
+                    }
+                    loadIndexedFiles();
+                })
+                .catch(() => showToast('Could not reach the admin endpoint', 'error'));
+        }
+
+        function loadIndexedFiles() {
+            adminFetch('/admin/list_context')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status !== 'success') return;
+                    indexedDocs = data.documents || [];
+                    renderFileList(
+                        document.getElementById('indexedFiles'),
+                        indexedDocs.map(d => ({ name: d.source, meta: plural(d.chunks, 'chunk') })),
+                        'No files indexed yet.',
+                        deleteFile
+                    );
+                });
+        }
+
+        function deleteFile(sourceName) {
+            if (!confirm(`Remove "${sourceName}" from the organisation context for everyone?`)) return;
+            adminFetch(`/admin/delete_context?source=${encodeURIComponent(sourceName)}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    showToast(data.message || 'Delete failed',
+                              data.status === 'success' ? 'success' : 'error');
+                    loadContextStatus();
+                })
+                .catch(() => showToast('Delete request failed', 'error'));
+        }
+
+        wireDropZone('dropZone', 'fileInput', files => {
+            pendingFiles = files;
+            renderSelectedFiles();
+        });
+
+        function renderSelectedFiles() {
+            renderChips('selectedFiles', 'uploadBtn', pendingFiles, i => {
+                pendingFiles.splice(i, 1);
+                renderSelectedFiles();
+            });
+        }
+
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+        // Indexing is asynchronous: the upload returns 202 + job_id and we poll
+        // until it finishes. The previous version checked for status
+        // 'success' on the 202 body, so every successful upload showed an error.
+        async function waitForJob(jobId, filename) {
+            const deadline = Date.now() + 10 * 60 * 1000;
+            while (Date.now() < deadline) {
+                await sleep(1500);
+                let data;
+                try {
+                    const res = await adminFetch(`/admin/upload_status/${encodeURIComponent(jobId)}`);
+                    data = await res.json();
+                } catch (e) {
+                    continue;  // transient network blip; keep polling
+                }
+                if (data.status === 'processing') continue;
+                const result = data.result || {};
+                return {
+                    ok: data.status === 'success',
+                    message: result.message || `${filename}: ${data.status}`
+                };
+            }
+            return { ok: false, message: `${filename}: indexing timed out` };
+        }
+
+        async function uploadFiles() {
+            const key = getApiKey();
+            if (!key) { showToast('Enter the admin API key first', 'error'); return; }
+            if (pendingFiles.length === 0) return;
+
+            const btn = document.getElementById('uploadBtn');
+            btn.disabled = true;
+
+            for (let i = 0; i < pendingFiles.length; i++) {
+                const file = pendingFiles[i];
+                btn.innerHTML = `<span class="spinner"></span> Indexing ${i + 1}/${pendingFiles.length}...`;
+
+                const body = new FormData();
+                body.append('file', file);
+                try {
+                    const res = await adminFetch('/admin/upload_context', { method: 'POST', body });
+                    const data = await res.json();
+                    if (res.status !== 202 || !data.job_id) {
+                        showToast(data.message || `${file.name} was rejected`, 'error');
+                        continue;
+                    }
+                    const outcome = await waitForJob(data.job_id, file.name);
+                    showToast(outcome.message, outcome.ok ? 'success' : 'error');
+                } catch (e) {
+                    showToast(`Upload failed for ${file.name}`, 'error');
+                }
+            }
+
+            pendingFiles = [];
+            renderSelectedFiles();
+            btn.innerHTML = '<i class="fas fa-upload"></i> Upload &amp; Index';
+            loadContextStatus();
+        }
+
+        // Show what this chat already has as soon as the page loads.
+        loadChatContext();
+    </script>
+</body>
+</html></content>
+<parameter name="filePath">c:\Users\oshant01\OneDrive - dentsu\Desktop\Dentsu\MyProj\Agent_Kai\templates\index.html

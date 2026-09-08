@@ -1,0 +1,43 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache
+.pytest_cache
+.hypothesis
+.DS_Store
+.vscode/
+.idea/
+
+# Environment variables
+.env
+.env.local
+
+# Temporary files
+temp/
+tmp/
+
+# Local vector index (rebuildable: python manage_kb.py reindex)
+chroma_db/
+vectorstore/
+
+# Uploaded organisation-context files, plus their _manifest.json
+uploads/
+
+# .env.example IS tracked on purpose - only real secrets are ignored above.</content>
+<parameter name="filePath">c:\Users\oshant01\OneDrive - dentsu\Desktop\Dentsu\MyProj\Agent_Kai\.gitignore
