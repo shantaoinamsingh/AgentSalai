@@ -31,7 +31,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS", 120))
+DEFAULT_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS" or 120))
 
 
 class ProviderError(RuntimeError):

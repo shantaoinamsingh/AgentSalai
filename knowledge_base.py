@@ -36,6 +36,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Overridable so the test suite can point at a scratch directory instead of
 # operating on the live index.
+if os.getenv("VERCEL"):
+    STORAGE_BASE_DIR = "/tmp/agent_salai"
+else:
+    STORAGE_BASE_DIR = BASE_DIR
+    
 LOCAL_UPLOADS_DIR = os.getenv("UPLOADS_DIR") or os.path.join(BASE_DIR, "uploads")
 VECTORSTORE_DIR = os.getenv("VECTORSTORE_DIR") or os.path.join(BASE_DIR, "vectorstore")
 MANIFEST_PATH = os.path.join(LOCAL_UPLOADS_DIR, "_manifest.json")

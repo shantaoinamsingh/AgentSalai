@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Drop a chat this long after its last activity.
-CHAT_TTL_SECONDS = int(os.getenv("CHAT_TTL_SECONDS", 8 * 60 * 60))
+CHAT_TTL_SECONDS = int(os.getenv("CHAT_TTL_SECONDS" or 8 * 60 * 60))
 
 # Hard cap on tracked chats, so an unbounded number of visitors cannot
 # exhaust memory. Least-recently-used chats are evicted first.
