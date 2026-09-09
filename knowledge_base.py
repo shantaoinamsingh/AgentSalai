@@ -36,17 +36,38 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Overridable so the test suite can point at a scratch directory instead of
 # operating on the live index.
+# Use /tmp on Vercel because the deployed filesystem is read-only.
+# Locally, keep using the project's uploads/vectorstore directories.
+
 if os.getenv("VERCEL"):
     STORAGE_BASE_DIR = "/tmp/agent_salai"
 else:
     STORAGE_BASE_DIR = BASE_DIR
-    
-LOCAL_UPLOADS_DIR = os.getenv("UPLOADS_DIR") or os.path.join(BASE_DIR, "uploads")
-VECTORSTORE_DIR = os.getenv("VECTORSTORE_DIR") or os.path.join(BASE_DIR, "vectorstore")
-MANIFEST_PATH = os.path.join(LOCAL_UPLOADS_DIR, "_manifest.json")
-EMBEDDING_MARKER_PATH = os.path.join(VECTORSTORE_DIR, ".embedding_model")
+
+LOCAL_UPLOADS_DIR = (
+    os.getenv("UPLOADS_DIR")
+    or os.path.join(STORAGE_BASE_DIR, "uploads")
+)
+
+VECTORSTORE_DIR = (
+    os.getenv("VECTORSTORE_DIR")
+    or os.path.join(STORAGE_BASE_DIR, "vectorstore")
+)
+
+MANIFEST_PATH = os.path.join(
+    LOCAL_UPLOADS_DIR,
+    "_manifest.json"
+)
+
+EMBEDDING_MARKER_PATH = os.path.join(
+    VECTORSTORE_DIR,
+    ".embedding_model"
+)
 
 COLLECTION_NAME = "agent_kb"
+
+os.makedirs(LOCAL_UPLOADS_DIR, exist_ok=True)
+os.makedirs(VECTORSTORE_DIR, exist_ok=True)
 
 # Identity of the embedding space. Bump this if the model or its dimensions
 # change so stale indexes are detected instead of silently mixed.
