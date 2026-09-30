@@ -14,9 +14,8 @@ requests==2.34.2
 python-dotenv==1.2.2
 
 # Vector store. Embeddings run locally through chromadb's bundled ONNX build
-# of all-MiniLM-L6-v2, because the APIM gateway rejects every embedding
-# deployment. onnxruntime is a chromadb dependency but is pinned explicitly
-# since retrieval depends on it. No torch or sentence-transformers required.
+# of all-MiniLM-L6-v2. onnxruntime is a chromadb dependency but is pinned
+# explicitly since retrieval depends on it. No torch or sentence-transformers required.
 chromadb==1.5.4
 onnxruntime==1.20.1
 
@@ -31,6 +30,11 @@ openpyxl==3.1.5
 # Optional: only needed for the "Anthropic (Claude)" provider. The OpenAI,
 # OpenRouter and self-hosted providers are plain HTTP and need nothing extra.
 anthropic==0.107.1
+
+# Optional: Browser automation tools (for web browsing agent)
+# Install with: pip install playwright or pip install selenium
+# playwright==1.40.0
+# selenium==4.15.2
 
 # Tests
 pytest==9.0.3

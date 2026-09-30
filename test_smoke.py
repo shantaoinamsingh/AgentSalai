@@ -18,10 +18,6 @@ _SCRATCH = tempfile.mkdtemp(prefix="salai-test-")
 os.environ["VECTORSTORE_DIR"] = os.path.join(_SCRATCH, "vectorstore")
 os.environ["UPLOADS_DIR"] = os.path.join(_SCRATCH, "uploads")
 
-os.environ.setdefault("AZURE_OPENAI_API_KEY", "test-key")
-os.environ.setdefault("AZURE_OPENAI_ENDPOINT", "https://example.invalid")
-os.environ.setdefault("AZURE_OPENAI_DEPLOYMENT_NAME", "test-deployment")
-os.environ.setdefault("AZURE_OPENAI_API_VERSION", "2024-10-21")
 os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("ADMIN_API_KEY", "test-admin-key")
 
@@ -108,8 +104,8 @@ def indexed_kb():
     kb._add_chunks(
         "email_guidelines.txt",
         [
-            "All dentsu email signatures must use the approved logo header. "
-            "Letterhead artwork is available as JPGs in the dentsu brand hub."
+            "All email signatures must use the approved logo header. "
+            "Letterhead artwork is available as JPGs in the brand hub."
         ],
         {"uploaded_at": "test"},
     )
@@ -476,7 +472,7 @@ def test_provider_catalogue_is_well_formed():
     import providers
 
     catalog = providers.public_catalog()
-    assert len(catalog) >= 5
+    assert len(catalog) >= 4
     for entry in catalog:
         assert entry["id"] and entry["label"]
         assert isinstance(entry["needs_key"], bool)
@@ -509,11 +505,11 @@ def test_missing_key_is_reported_before_any_network_call():
 
 
 def test_only_image_capable_providers_generate_images():
-    """The dentsu gateway blocks non-chat models, so it must refuse early."""
+    """Only providers with supports_images=true can generate images."""
     import providers
 
     with pytest.raises(providers.ProviderError) as excinfo:
-        providers.generate_image("dentsu", "a red square")
+        providers.generate_image("anthropic", "a red square")
     assert "cannot generate images" in str(excinfo.value)
 
 
@@ -543,12 +539,12 @@ def test_adaptive_thinking_models_skip_temperature():
 # ─── settings store ───────────────────────────────────────────────────────────
 
 
-def test_settings_default_to_the_dentsu_provider():
+def test_settings_default_to_the_openai_provider():
     from settings_store import SettingsStore
 
     store = SettingsStore()
     settings = store.get("u1")
-    assert settings["provider"] == "dentsu"
+    assert settings["provider"] == "openai"
     assert settings["model"]  # defaulted from the provider spec
 
 
@@ -778,7 +774,15 @@ def test_export_endpoint_rejects_junk(client):
     assert client.post("/export/docx", json={"headers": ["A"], "rows": [["1"]]}).status_code == 400
 
 
-def test_image_generation_blocked_on_the_dentsu_gateway(client):
+def test_image_generation_blocked_for_non_image_providers(client):
+    """Providers that don't support image generation should refuse early."""
+    from settings_store import settings_store
+    # Switch to anthropic which doesn't support images
+    settings_store.update("test-user", {"provider": "anthropic"})
+
+    with client.session_transaction() as sess:
+        sess["user_id"] = "test-user"
+
     response = client.post("/generate/image", json={"prompt": "a red square"})
     assert response.status_code == 400
     assert "cannot generate images" in response.get_json()["message"]
@@ -825,3 +829,59 @@ def test_chart_format_documents_the_fenced_block(indexed_kb):
     system = messages[0]["content"]
     assert "```chart" in system
     assert "datasets" in system and "labels" in system
+
+
+def test_anthropic_conversion_groups_tool_results():
+    import providers
+
+    system, turns = providers._split_system(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "open python.org"},
+            {"role": "assistant", "content": "", "_anthropic_content": ["blocks"]},
+            {"role": "tool", "tool_call_id": "a", "content": "ok"},
+            {"role": "tool", "tool_call_id": "b", "content": "done"},
+        ]
+    )
+    assert system == "sys"
+    assert [t["role"] for t in turns] == ["user", "assistant", "user"]
+    assert turns[1]["content"] == ["blocks"]
+    assert [b["tool_use_id"] for b in turns[2]["content"]] == ["a", "b"]
+
+
+def test_tool_loop_executes_calls_and_returns_final_answer(monkeypatch):
+    import app as app_module
+
+    if not app_module.HAS_BROWSER_TOOLS:
+        pytest.skip("browser tools not installed")
+
+    replies = [
+        {
+            "content": "",
+            "tool_calls": [{"id": "t1", "name": "open_browser", "arguments": {"session_id": "evil"}}],
+            "message": {"role": "assistant", "content": None, "tool_calls": []},
+        },
+        {"content": "All done.", "tool_calls": [], "message": {}},
+    ]
+    seen_tools = []
+    monkeypatch.setattr(
+        app_module.providers,
+        "chat_with_tools",
+        lambda *a, **k: (seen_tools.append(a[3]), replies.pop(0))[1],
+    )
+    executed = []
+
+    async def fake_execute(name, args, session_id=None):
+        executed.append((name, args))
+        return "Browser opened"
+
+    monkeypatch.setattr(app_module.agent_executor, "execute_tool", fake_execute)
+
+    messages = [{"role": "user", "content": "open a browser"}]
+    answer = app_module._run_tool_loop("openai", "gpt-4o", messages, "chat-123", {})
+
+    assert answer == "All done."
+    assert executed[0][0] == "open_browser"
+    assert executed[0][1]["session_id"] == "chat-123"
+    assert "session_id" not in seen_tools[0][0]["parameters"]["properties"]
+    assert messages[-1] == {"role": "tool", "tool_call_id": "t1", "content": "Browser opened"}

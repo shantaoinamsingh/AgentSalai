@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 """Pluggable LLM providers.
 
-The app started life hard-wired to one Azure OpenAI deployment behind dentsu's
-APIM gateway. That gateway is heavily restricted -- it rejects everything that
-is not a GPT-4/o-series chat model, which is why embeddings run locally and why
-image generation is impossible through it:
-
-    403 {"error": {"message": "Model not allowed. You can only use o1, o3,
-         o3-deep-research, or GPT-4 models.", "code": "model_not_allowed"}}
-
-So users can now pick a provider and supply their own credentials. The dentsu
-gateway stays the default (it needs no user key); anything else unlocks the
-models -- and the capabilities -- that the gateway blocks.
-
-Every provider takes and returns the same shapes:
+Users can pick a provider and supply their own credentials. Every provider
+takes and returns the same shapes:
 
     chat(messages, ...) -> str            messages are OpenAI-style dicts
     list_models(...)    -> list[str]
@@ -22,6 +11,7 @@ Every provider takes and returns the same shapes:
 Credentials are passed in per call. Nothing in this module reads or writes them
 from disk; see settings_store.py for how they are held.
 """
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -31,7 +21,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS" or 120))
+DEFAULT_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS" , 120))
 
 
 class ProviderError(RuntimeError):
@@ -42,7 +32,7 @@ class ProviderError(RuntimeError):
 class ProviderSpec:
     id: str
     label: str
-    kind: str  # azure_apim | openai | anthropic
+    kind: str  # openai | anthropic
     needs_key: bool
     description: str
     models: List[str] = field(default_factory=list)
@@ -73,17 +63,6 @@ class ProviderSpec:
 # Model lists are starting points for the dropdown, not a whitelist -- users can
 # type any model id their provider serves.
 PROVIDERS: Dict[str, ProviderSpec] = {
-    "dentsu": ProviderSpec(
-        id="dentsu",
-        label="dentsu Azure OpenAI",
-        kind="azure_apim",
-        needs_key=False,
-        description="Shared internal gateway. No key needed, but it only allows "
-        "GPT-4 and o-series chat models (no embeddings, no image generation).",
-        models=["GPT4o128k", "o1", "o3"],
-        default_model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "GPT4o128k"),
-        base_url=os.getenv("AZURE_OPENAI_ENDPOINT", ""),
-    ),
     "openai": ProviderSpec(
         id="openai",
         label="OpenAI",
@@ -113,6 +92,19 @@ PROVIDERS: Dict[str, ProviderSpec] = {
         base_url="https://api.anthropic.com",
         can_list_models=True,
         key_url="https://console.anthropic.com/settings/keys",
+    ),
+    "gemini": ProviderSpec(
+        id="gemini",
+        label="Google Gemini",
+        kind="openai",
+        needs_key=True,
+        description="Gemini models direct from Google AI Studio.",
+        models=["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
+        default_model="gemini-2.5-flash",
+        # Google's OpenAI-compatible surface: same chat/tools/models shapes.
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        can_list_models=True,
+        key_url="https://aistudio.google.com/apikey",
     ),
     "openrouter": ProviderSpec(
         id="openrouter",
@@ -149,7 +141,7 @@ PROVIDERS: Dict[str, ProviderSpec] = {
     ),
 }
 
-DEFAULT_PROVIDER = "dentsu"
+DEFAULT_PROVIDER = "openai"
 
 
 def get_spec(provider_id: str) -> ProviderSpec:
@@ -166,14 +158,30 @@ def public_catalog() -> List[Dict[str, Any]]:
 # ─── message shaping ──────────────────────────────────────────────────────────
 
 
-def _split_system(messages: List[Dict[str, str]]) -> tuple:
-    """Separate system text from the turn list (Anthropic keeps them apart)."""
+def _split_system(messages: List[Dict[str, Any]]) -> tuple:
+    """Separate system text from the turn list (Anthropic keeps them apart).
+
+    Also converts OpenAI-style tool turns into Anthropic tool_use/tool_result blocks.
+    """
     system_chunks = [m["content"] for m in messages if m.get("role") == "system"]
-    turns = [
-        {"role": m["role"], "content": m["content"]}
-        for m in messages
-        if m.get("role") in ("user", "assistant")
-    ]
+    turns: List[Dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            block = {
+                "type": "tool_result",
+                "tool_use_id": m["tool_call_id"],
+                "content": m.get("content") or "",
+            }
+            # Anthropic wants all results for one assistant turn in a single user turn.
+            if turns and turns[-1]["role"] == "user" and isinstance(turns[-1]["content"], list):
+                turns[-1]["content"].append(block)
+            else:
+                turns.append({"role": "user", "content": [block]})
+        elif role == "assistant" and m.get("_anthropic_content") is not None:
+            turns.append({"role": "assistant", "content": m["_anthropic_content"]})
+        elif role in ("user", "assistant"):
+            turns.append({"role": role, "content": m["content"]})
     return "\n\n".join(system_chunks), turns
 
 
@@ -194,19 +202,35 @@ def _openai_headers(spec: ProviderSpec, api_key: Optional[str]) -> Dict[str, str
 def _openai_chat(
     spec: ProviderSpec,
     model: str,
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     api_key: Optional[str],
     base_url: str,
     temperature: float,
     max_tokens: int,
-) -> str:
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     url = f"{base_url.rstrip('/')}/chat/completions"
-    payload = {
+    # Keys starting with "_" carry provider-private state (e.g. Anthropic blocks).
+    clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
+    payload: Dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": clean,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if tools:
+        payload["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": t.get("parameters", {"type": "object", "properties": {}}),
+                },
+            }
+            for t in tools
+        ]
+        payload["tool_choice"] = "auto"
     try:
         r = requests.post(
             url, json=payload, headers=_openai_headers(spec, api_key), timeout=DEFAULT_TIMEOUT
@@ -216,13 +240,46 @@ def _openai_chat(
     except requests.exceptions.RequestException as e:
         raise ProviderError(f"Could not reach {spec.label}: {e}")
 
+    if r.status_code == 404:
+        raise ProviderError(_http_message(spec, r) + _suggest_models(spec, model, api_key, base_url))
     if r.status_code != 200:
         raise ProviderError(_http_message(spec, r))
 
     try:
-        return r.json()["choices"][0]["message"]["content"]
+        msg = r.json()["choices"][0]["message"]
     except (KeyError, IndexError, ValueError):
         raise ProviderError(f"{spec.label} returned an unexpected response shape.")
+
+    raw_calls = msg.get("tool_calls") or []
+    calls = []
+    for c in raw_calls:
+        fn = c.get("function", {})
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except ValueError:
+            args = {}
+        calls.append({"id": c.get("id"), "name": fn.get("name"), "arguments": args})
+
+    content = msg.get("content") or ""
+    assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
+    if raw_calls:
+        assistant_msg["tool_calls"] = raw_calls
+    return {"content": content, "tool_calls": calls, "message": assistant_msg}
+
+
+def _suggest_models(spec: ProviderSpec, model: str, api_key: Optional[str], base_url: str) -> str:
+    """On a model 404, name a few models this key can actually use."""
+    if not spec.can_list_models:
+        return ""
+    try:
+        ids = _openai_models(spec, api_key, base_url)
+    except Exception:
+        return ""
+    family = model.split("-")[0].lower()
+    skip = ("embedding", "tts", "image", "audio", "aqa", "live")
+    matches = [i for i in ids if i.lower().startswith(family) and not any(s in i.lower() for s in skip)]
+    picks = (matches or ids)[:8]
+    return f" Models available to this key include: {', '.join(picks)}. Pick one in Settings." if picks else ""
 
 
 def _openai_models(spec: ProviderSpec, api_key: Optional[str], base_url: str) -> List[str]:
@@ -231,56 +288,11 @@ def _openai_models(spec: ProviderSpec, api_key: Optional[str], base_url: str) ->
     if r.status_code != 200:
         raise ProviderError(_http_message(spec, r))
     data = r.json().get("data", [])
-    ids = sorted(m["id"] for m in data if isinstance(m, dict) and m.get("id"))
+    # Gemini lists ids as "models/gemini-..."; chat expects the bare name.
+    ids = sorted(
+        m["id"].removeprefix("models/") for m in data if isinstance(m, dict) and m.get("id")
+    )
     return ids
-
-
-# ─── dentsu APIM (Azure OpenAI behind a gateway) ──────────────────────────────
-
-
-def _dentsu_chat(
-    model: str,
-    messages: List[Dict[str, str]],
-    temperature: float,
-    max_tokens: int,
-) -> str:
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
-    server_key = os.getenv("AZURE_OPENAI_API_KEY")
-    if not endpoint or not server_key:
-        raise ProviderError(
-            "The dentsu gateway is not configured on the server. "
-            "Pick another provider, or set AZURE_OPENAI_* in .env."
-        )
-
-    url = f"{endpoint}/openai/deployments/{model}/chat/completions?api-version={api_version}"
-    headers = {
-        "x-brand": os.getenv("API_BRAND", "dentsu"),
-        "x-service-line": os.getenv("API_SERVICE_LINE", "Functions"),
-        "x-project": os.getenv("API_PROJECT", "test"),
-        "Ocp-Apim-Subscription-Key": server_key,
-        "api-version": os.getenv("API_GATEWAY_VERSION", "v15"),
-        "Content-Type": "application/json",
-    }
-    # This gateway wants max_completion_tokens, not max_tokens.
-    payload = {
-        "messages": messages,
-        "temperature": temperature,
-        "max_completion_tokens": max_tokens,
-    }
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=DEFAULT_TIMEOUT)
-    except requests.exceptions.Timeout:
-        raise ProviderError(f"The dentsu gateway timed out after {DEFAULT_TIMEOUT}s.")
-    except requests.exceptions.RequestException as e:
-        raise ProviderError(f"Could not reach the dentsu gateway: {e}")
-
-    if r.status_code != 200:
-        raise ProviderError(_http_message(PROVIDERS["dentsu"], r))
-    try:
-        return r.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, ValueError):
-        raise ProviderError("The dentsu gateway returned an unexpected response shape.")
 
 
 # ─── Anthropic ────────────────────────────────────────────────────────────────
@@ -302,7 +314,8 @@ def _anthropic_chat(
     api_key: str,
     temperature: float,
     max_tokens: int,
-) -> str:
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     anthropic, client = _anthropic_client(api_key)
     system, turns = _split_system(messages)
     if not turns:
@@ -315,6 +328,15 @@ def _anthropic_chat(
     }
     if system:
         kwargs["system"] = system
+    if tools:
+        kwargs["tools"] = [
+            {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "input_schema": t.get("parameters", {"type": "object", "properties": {}}),
+            }
+            for t in tools
+        ]
     # Sampling params are rejected on the newest models (they always think), so
     # only send temperature to models that still accept it.
     if not _is_adaptive_thinking_model(model):
@@ -340,9 +362,17 @@ def _anthropic_chat(
 
     # Responses can carry thinking blocks alongside text; keep only the text.
     parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-    if not parts:
+    calls = [
+        {"id": b.id, "name": b.name, "arguments": dict(b.input or {})}
+        for b in response.content
+        if getattr(b, "type", None) == "tool_use"
+    ]
+    if not parts and not calls:
         raise ProviderError("Claude returned no text content.")
-    return "".join(parts)
+    content = "".join(parts)
+    # The full block list (thinking included) must be echoed back on tool turns.
+    assistant_msg = {"role": "assistant", "content": content, "_anthropic_content": response.content}
+    return {"content": content, "tool_calls": calls, "message": assistant_msg}
 
 
 def _is_adaptive_thinking_model(model: str) -> bool:
@@ -376,6 +406,9 @@ def _http_message(spec: ProviderSpec, response) -> str:
     detail = ""
     try:
         body = response.json()
+        # Gemini wraps its error object in a one-element list.
+        if isinstance(body, list) and body:
+            body = body[0]
         if isinstance(body, dict):
             err = body.get("error")
             if isinstance(err, dict):
@@ -388,10 +421,7 @@ def _http_message(spec: ProviderSpec, response) -> str:
 
     code = response.status_code
     if code in (401, 403):
-        base = f"{spec.label} rejected the credentials"
-        if spec.id == "dentsu":
-            base = f"{spec.label} refused the request"
-        return f"{base} (HTTP {code}). {detail}".strip()
+        return f"{spec.label} rejected the credentials (HTTP {code}). {detail}".strip()
     if code == 404:
         return f"{spec.label}: model or endpoint not found (HTTP 404). {detail}".strip()
     if code == 429:
@@ -414,6 +444,36 @@ def chat(
     max_tokens: int = 8192,
 ) -> str:
     """Send one completion request and return the assistant's text."""
+    return chat_with_tools(
+        provider_id,
+        model,
+        messages,
+        None,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )["content"]
+
+
+def chat_with_tools(
+    provider_id: str,
+    model: str,
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]],
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 8192,
+) -> Dict[str, Any]:
+    """One completion that may request tools.
+
+    ``tools`` are flat ``{name, description, parameters}`` dicts. Returns
+    ``{"content": str, "tool_calls": [{id, name, arguments}], "message": dict}``
+    where ``message`` is the assistant turn to append before the tool results
+    (sent back as ``{"role": "tool", "tool_call_id", "content"}``).
+    """
     spec = get_spec(provider_id)
     model = (model or spec.default_model).strip()
     if not model:
@@ -423,14 +483,12 @@ def chat(
 
     url = (base_url or spec.base_url or "").strip()
 
-    if spec.kind == "azure_apim":
-        return _dentsu_chat(model, messages, temperature, max_tokens)
     if spec.kind == "anthropic":
-        return _anthropic_chat(model, messages, api_key, temperature, max_tokens)
+        return _anthropic_chat(model, messages, api_key, temperature, max_tokens, tools)
     if spec.kind == "openai":
         if not url:
             raise ProviderError(f"{spec.label} needs a base URL. Add one in Settings.")
-        return _openai_chat(spec, model, messages, api_key, url, temperature, max_tokens)
+        return _openai_chat(spec, model, messages, api_key, url, temperature, max_tokens, tools)
     raise ProviderError(f"Provider kind {spec.kind!r} is not implemented.")
 
 
@@ -468,8 +526,7 @@ def generate_image(
 ) -> Dict[str, str]:
     """Generate one image. Returns {"b64": ...} or {"url": ...}.
 
-    Only providers whose spec sets supports_images can do this -- notably not
-    the dentsu gateway, which blocks non-chat models outright.
+    Only providers whose spec sets supports_images can do this.
     """
     spec = get_spec(provider_id)
     if not spec.supports_images:
@@ -530,3 +587,36 @@ def test_connection(
         "message": f"{spec.label} responded: {reply.strip()[:60]}",
         "model": model or spec.default_model,
     }
+
+
+def supports_tools(provider_id: str) -> bool:
+    """Check if a provider supports tool use/function calling.
+
+    Args:
+        provider_id: Provider ID
+
+    Returns:
+        True if provider supports tool use
+    """
+    get_spec(provider_id)
+    # Many self-hosted models reject a `tools` payload, so leave them out.
+    return provider_id in ("openai", "anthropic", "gemini", "openrouter")
+
+
+def get_tools_for_provider(provider_id: str) -> List[Dict[str, Any]]:
+    """Get available tools for a provider.
+
+    Args:
+        provider_id: Provider ID
+
+    Returns:
+        List of tool definitions for the provider
+    """
+    if not supports_tools(provider_id):
+        return []
+
+    try:
+        from agent import agent_executor
+        return agent_executor.get_available_tools()
+    except ImportError:
+        return []

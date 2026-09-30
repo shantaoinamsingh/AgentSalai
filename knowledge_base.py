@@ -7,17 +7,13 @@ Per-chat file attachments are a separate concern and live in chat_store.py.
 Retrieval design notes
 ----------------------
 Embeddings run **locally** via the ONNX build of ``all-MiniLM-L6-v2`` that
-ships with chromadb. The Dentsu APIM gateway rejects every embedding
-deployment ("Model not allowed. You can only use o1, o3, o3-deep-research,
-or GPT-4 models"), so a remote embedding call is not an option. The previous
-implementation worked around this by asking GPT-4o to emit "1536 floats" and
-falling back to an all-zero vector on failure, which made similarity search
-meaningless -- any query returned arbitrary chunks.
+ships with chromadb. This is efficient and works offline after the model is
+downloaded once.
 
-Because the local model is 384-dimensional, an index built by the old code is
-incompatible *and* semantically worthless. We record the embedding identity in
-a marker file and refuse to serve retrieval from a stale index rather than
-silently returning garbage. Run ``python manage_kb.py reindex`` to rebuild.
+We record the embedding model identity in a marker file and refuse to serve
+retrieval from a stale index if it was built with a different model, rather
+than silently returning mismatched vectors. Run ``python manage_kb.py reindex``
+to rebuild the index after changing the embedding model.
 """
 import hashlib
 import json

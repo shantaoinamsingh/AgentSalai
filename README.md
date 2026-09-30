@@ -1,7 +1,7 @@
 # Salai
 
-A Flask + SocketIO chat assistant over Azure OpenAI (via the dentsu APIM gateway),
-with two independent tiers of document context.
+A Flask + SocketIO chat assistant with pluggable LLM providers and two independent
+tiers of document context.
 
 ## The two context tiers
 
@@ -48,10 +48,6 @@ Fill in the required values:
 
 | Variable | Purpose |
 |---|---|
-| `AZURE_OPENAI_API_KEY` | APIM subscription key |
-| `AZURE_OPENAI_ENDPOINT` | e.g. `https://ai-api-dev.dentsu.com` |
-| `AZURE_OPENAI_DEPLOYMENT_NAME` | e.g. `GPT4o128k` |
-| `AZURE_OPENAI_API_VERSION` | e.g. `2024-10-21` |
 | `SECRET_KEY` | Flask session signing key |
 | `ADMIN_API_KEY` | gates every `/admin` endpoint |
 
@@ -61,7 +57,8 @@ Generate the two secrets with:
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-`.env.example` documents the optional retrieval, limit and server settings.
+`.env.example` documents the optional retrieval, limit and server settings. Once the
+app is running, users can configure their LLM provider and API key in the Settings UI.
 
 ### 3. Run
 
@@ -168,23 +165,10 @@ be instructed to answer from it. On the current corpus an on-topic query scores
 ~0.44 and an off-topic one ~0.93; the default cut-off of `0.75` separates them
 with margin. Tune it with `KB_MAX_DISTANCE` — lower is stricter.
 
-### Why embeddings are local
-
-The APIM gateway rejects every embedding deployment:
-
-```
-403 {"error":{"message":"Model not allowed. You can only use o1, o3,
-     o3-deep-research, or GPT-4 models.","code":"model_not_allowed"}}
-```
-
-So there is no remote embedding option, and embeddings run on the local ONNX
-model instead. If an embedding deployment is ever allowed through the gateway,
-swap the embedding function in `knowledge_base.py`, bump `EMBEDDING_ID`, and
-run `python manage_kb.py reindex`.
-
+Embeddings run locally using ChromaDB's bundled ONNX model (`all-MiniLM-L6-v2`).
 `EMBEDDING_ID` is recorded in `vectorstore/.embedding_model`. If it does not
 match the running code, retrieval is **disabled** rather than served from a
-mismatched vector space, and the app tells you to reindex.
+mismatched vector space, and the app tells you to reindex via `python manage_kb.py reindex`.
 
 ## Architecture
 
@@ -231,7 +215,4 @@ OCR; supply a text-based version.
 Earlier versions of this README documented SharePoint and Microsoft Graph
 integration — indexing directly from a SharePoint folder and storing the vector
 store in an `AgentKai_VectorStore` folder. None of that exists in the code.
-Documents are uploaded through the UI or CLI and stored locally. The
-`AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_TENANT_ID` /
-`SHAREPOINT_SITE_URL` variables are unused and commented out in
-`.env.example`.
+Documents are uploaded through the UI or CLI and stored locally.

@@ -17,6 +17,7 @@ Two session identities, also deliberately separate:
 * ``user_id`` -- stable for the browser; keys provider settings and API keys,
   which must survive starting a new conversation.
 """
+import copy
 import functools
 import hmac
 import logging
@@ -47,9 +48,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Only these are needed to boot. Provider credentials are no longer required:
-# a user can supply their own key for OpenAI/Anthropic/OpenRouter in Settings,
-# so demanding the dentsu gateway's config up front would block that.
+try:
+    from agent import agent_executor, run_sync as run_agent_sync
+
+    HAS_BROWSER_TOOLS = bool(agent_executor.get_available_tools())
+except ImportError:
+    HAS_BROWSER_TOOLS = False
+if not HAS_BROWSER_TOOLS:
+    logger.info("Browser tools not available (install playwright to enable)")
+
+# Visible by default so a local user can watch the agent work.
+BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "false").lower() in ("1", "true", "yes")
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", 15))
+MAX_TOOL_RESULT_CHARS = 4000
+
+# Only these are needed to boot. Provider credentials are not required since
+# users can supply their own key for OpenAI/Anthropic/OpenRouter in Settings.
 REQUIRED_VARS = ["SECRET_KEY", "ADMIN_API_KEY"]
 
 missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
@@ -59,25 +73,10 @@ if missing:
         "Copy .env.example to .env and fill it in."
     )
 
-# Needed only for the built-in "dentsu Azure OpenAI" provider.
-DENTSU_VARS = [
-    "AZURE_OPENAI_API_KEY",
-    "AZURE_OPENAI_ENDPOINT",
-    "AZURE_OPENAI_DEPLOYMENT_NAME",
-    "AZURE_OPENAI_API_VERSION",
-]
-DENTSU_CONFIGURED = all(os.getenv(v) for v in DENTSU_VARS)
-if not DENTSU_CONFIGURED:
-    logger.warning(
-        "The dentsu gateway provider is unavailable (missing %s). Users must "
-        "choose another provider and supply a key in Settings.",
-        ", ".join(v for v in DENTSU_VARS if not os.getenv(v)),
-    )
-
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 50 * 1024 * 1024))
 
 SYSTEM_BASE = (
-    "You are Salai, a helpful AI assistant for dentsu staff. "
+    "You are Salai, a helpful AI assistant with web browsing capabilities. "
     "Answer clearly and concisely, using Markdown where it helps.\n"
     # Retrieval runs per turn, so a follow-up question may carry no context
     # even though an earlier turn was grounded in real documents. Without this
@@ -85,8 +84,33 @@ SYSTEM_BASE = (
     # access to those documents"), which reads as a contradiction to the user.
     "Context is supplied per message, so documents quoted earlier in this "
     "conversation may not be repeated below. Trust your earlier answers and "
-    "never claim you lack access to material you have already been shown."
+    "never claim you lack access to material you have already been shown.\n"
 )
+
+# Add browser tools info if available
+if HAS_BROWSER_TOOLS:
+    SYSTEM_BASE += """
+## Browser Automation Capabilities
+
+You have access to browser automation tools. When users ask you to:
+- Search for information online
+- Check if a website is working
+- Extract data from websites
+- Take screenshots
+- Fill and submit forms
+
+You should use the browser tools to complete these tasks autonomously instead of giving manual instructions.
+
+Available tools: open_browser, navigate, click_element, fill_input, take_screenshot, execute_js, close_browser
+
+Always use these tools when appropriate rather than telling users to do things manually.
+Call open_browser first. The browser stays open between messages, so leave it open
+unless the user asks you to close it. To search the web, navigate straight to
+https://www.bing.com/search?q=your+query (Google and DuckDuckGo block automated
+browsers with a CAPTCHA) rather than filling a search box. The navigate result
+includes the page text, so read results from it.
+Only whitelisted domains can be opened; if a navigation is refused, tell the user.
+"""
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY")
@@ -249,7 +273,11 @@ def build_messages(
 
 
 def get_answer(user_input: str, chat_id: str, user_id: str) -> str:
-    """Run one conversation turn and persist it to the chat's history."""
+    """Run one conversation turn and persist it to the chat's history.
+
+    With browser tools support, the agent can browse websites, take screenshots,
+    fill forms, and execute JavaScript when needed.
+    """
     user_input = (user_input or "").strip()
     if not user_input:
         return "Please enter a question."
@@ -270,16 +298,17 @@ def get_answer(user_input: str, chat_id: str, user_id: str) -> str:
         len(messages) - 2,
     )
 
+    chat_kwargs = dict(
+        api_key=settings_store.api_key(user_id, provider_id),
+        base_url=settings["base_url"],
+        temperature=settings["temperature"],
+        max_tokens=settings["max_tokens"],
+    )
     try:
-        answer = providers.chat(
-            provider_id,
-            settings["model"],
-            messages,
-            api_key=settings_store.api_key(user_id, provider_id),
-            base_url=settings["base_url"],
-            temperature=settings["temperature"],
-            max_tokens=settings["max_tokens"],
-        )
+        if HAS_BROWSER_TOOLS and providers.supports_tools(provider_id):
+            answer = _run_tool_loop(provider_id, settings["model"], messages, chat_id, chat_kwargs)
+        else:
+            answer = providers.chat(provider_id, settings["model"], messages, **chat_kwargs)
     except providers.ProviderError as e:
         # These messages are written to be shown to the user, and the provider
         # layer keeps raw response bodies (which can echo the API key) out.
@@ -291,6 +320,52 @@ def get_answer(user_input: str, chat_id: str, user_id: str) -> str:
     chat_store.append_message(chat_id, "user", user_input)
     chat_store.append_message(chat_id, "assistant", answer)
     return answer
+
+
+def _browser_tool_defs() -> list:
+    """Tool definitions for the LLM, minus the params the app fills in itself."""
+    defs = []
+    for tool in agent_executor.get_available_tools():
+        tool = copy.deepcopy(tool)
+        params = tool.setdefault("parameters", {"type": "object", "properties": {}})
+        for hidden in ("session_id", "headless"):
+            params.get("properties", {}).pop(hidden, None)
+            if hidden in params.get("required", []):
+                params["required"].remove(hidden)
+        defs.append(tool)
+    return defs
+
+
+def _run_tool_loop(provider_id: str, model: str, messages: list, chat_id: str, chat_kwargs: dict) -> str:
+    """Let the model call browser tools until it produces a final answer."""
+    tools = _browser_tool_defs()
+    for _ in range(MAX_TOOL_ROUNDS):
+        turn = providers.chat_with_tools(provider_id, model, messages, tools, **chat_kwargs)
+        if not turn["tool_calls"]:
+            return turn["content"] or "(no response)"
+
+        messages.append(turn["message"])
+        for call in turn["tool_calls"]:
+            args = dict(call["arguments"] or {})
+            # One browser per conversation; the model never picks the session.
+            args["session_id"] = chat_id
+            if call["name"] == "open_browser":
+                args["headless"] = BROWSER_HEADLESS
+            logger.info("[chat %s] tool %s %s", chat_id[:8], call["name"], {k: v for k, v in args.items() if k != "session_id"})
+            try:
+                result = run_agent_sync(agent_executor.execute_tool(call["name"], args, chat_id))
+            except Exception as e:
+                logger.exception("[chat %s] tool %s failed", chat_id[:8], call["name"])
+                result = f"Error: {e}"
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": str(result)[:MAX_TOOL_RESULT_CHARS],
+                }
+            )
+
+    return f"I stopped after {MAX_TOOL_ROUNDS} browser steps without finishing. Try a more specific request."
 
 
 # ─── page ─────────────────────────────────────────────────────────────────────
@@ -585,6 +660,16 @@ def chat_status():
 # ─── socket ───────────────────────────────────────────────────────────────────
 
 
+def _run_off_hub(fn, *args):
+    # Browser turns can run for a minute; blocking gevent's hub that long
+    # misses Socket.IO pings and the client disconnects before the reply.
+    if socketio.async_mode in ("gevent", "gevent_uwsgi"):
+        import gevent
+
+        return gevent.get_hub().threadpool.apply(fn, args)
+    return fn(*args)
+
+
 @socketio.on("voice_command")
 def handle_voice_command(data):
     command = (data or {}).get("command", "")
@@ -592,7 +677,7 @@ def handle_voice_command(data):
     user_id = current_user_id()
     logger.info("[chat %s] received: %.80s", chat_id[:8], command)
     try:
-        response = get_answer(command, chat_id, user_id)
+        response = _run_off_hub(get_answer, command, chat_id, user_id)
     except Exception:
         logger.exception("Unhandled error answering a message")
         response = "Something went wrong handling that message. Please try again."
@@ -709,8 +794,8 @@ def export(fmt):
 def generate_image():
     """Generate an image with the user's own provider.
 
-    Not possible on the dentsu gateway, which rejects every non-chat model --
-    the provider layer returns a clear message pointing at Settings.
+    Only providers that support image generation can do this. The provider layer
+    returns a clear message if the selected provider doesn't support it.
     """
     user_id = current_user_id()
     settings = settings_store.get(user_id)

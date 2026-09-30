@@ -1,0 +1,37 @@
+{
+  "version": 2,
+  "buildCommand": "pip install -r requirements.txt",
+  "framework": "flask",
+  "env": {
+    "PYTHONUNBUFFERED": "1",
+    "FLASK_APP": "app.py",
+    "LOG_LEVEL": "INFO"
+  },
+  "functions": {
+    "app.py": {
+      "runtime": "python3.11",
+      "memory": 3008,
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/app.py"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/static/(.*)",
+      "dest": "/static/$1",
+      "headers": {
+        "Cache-Control": "public, max-age=3600, s-maxage=3600"
+      }
+    },
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/$1",
+      "methods": ["GET", "POST", "PUT", "DELETE", "PATCH"]
+    }
+  ]
+}

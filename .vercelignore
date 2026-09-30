@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+.tox
+venv/
+.venv/
+
+# IDEs
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local development
+.env
+.env.local
+*.log
+
+# Test files
+test_*.py
+tests/
+
+# Documentation
+*.md
+docs/
+
+# Build
+build/
+dist/
+
+# Environment-specific
+requirements-azure.txt
+web.config
+startup.sh
+Dockerfile
+docker-compose.yml

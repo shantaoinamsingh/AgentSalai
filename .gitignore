@@ -39,5 +39,9 @@ vectorstore/
 # Uploaded organisation-context files, plus their _manifest.json
 uploads/
 
-# .env.example IS tracked on purpose - only real secrets are ignored above.</content>
-<parameter name="filePath">c:\Users\oshant01\OneDrive - dentsu\Desktop\Dentsu\MyProj\Agent_Kai\.gitignore
+# .env.example IS tracked on purpose - only real secrets are ignored above.
+
+# Browser tool output
+screenshots/
+# Per-user Claude Code settings
+.claude/settings.local.json

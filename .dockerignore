@@ -1,0 +1,55 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+.tox
+venv/
+.venv/
+*.egg
+
+# IDEs
+.vscode
+.idea
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Local development
+.env
+.env.local
+*.log
+local_settings.py
+
+# Test files
+test_*.py
+tests/
+.coverage
+htmlcov/
+
+# Documentation
+*.md
+docs/
+
+# Build
+build/
+dist/
+
+# Vercel specific
+.vercel
+.vercelignore
+
+# Node modules (if any)
+node_modules/
+npm-debug.log

@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  salai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: salai-chat
+    ports:
+      - "8000:8000"
+    environment:
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-dev-admin-key-change-in-production}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - VECTORSTORE_DIR=/app/vectorstore
+      - UPLOADS_DIR=/app/uploads
+    volumes:
+      - ./vectorstore:/app/vectorstore
+      - ./uploads:/app/uploads
+      - ./templates:/app/templates
+      - ./static:/app/static
+    networks:
+      - salai-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  salai-network:
+    driver: bridge
+
+volumes:
+  vectorstore:
+  uploads:
