@@ -46,6 +46,9 @@ MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", 20))
 MAX_CONTEXT_CHARS_PER_FILE = int(os.getenv("MAX_CONTEXT_CHARS_PER_FILE", 40_000))
 MAX_CONTEXT_CHARS_TOTAL = int(os.getenv("MAX_CONTEXT_CHARS_TOTAL", 60_000))
 MAX_CONTEXT_FILES = int(os.getenv("MAX_CONTEXT_FILES", 10))
+# Images go to the model as images, not text. 5 MB is Anthropic's per-image limit.
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", 5 * 1024 * 1024))
+MAX_CONTEXT_IMAGES = int(os.getenv("MAX_CONTEXT_IMAGES", 5))
 
 
 class ChatStore:
@@ -158,12 +161,61 @@ class ChatStore:
             "message": message,
         }
 
+    def add_image(self, chat_id: str, filename: str, media_type: str, data_b64: str, size: int) -> Dict[str, Any]:
+        """Attach an image the model will see directly (not as extracted text)."""
+        if size > MAX_IMAGE_BYTES:
+            return {
+                "status": "error",
+                "message": f"{filename} is {size / 1e6:.1f} MB; images can be at most "
+                f"{MAX_IMAGE_BYTES / 1e6:.0f} MB",
+            }
+        with self._lock:
+            self._evict()
+            context = self._touch(chat_id)["context"]
+            if filename not in context:
+                if len(context) >= MAX_CONTEXT_FILES:
+                    return {
+                        "status": "error",
+                        "message": f"This chat already has {MAX_CONTEXT_FILES} files attached. "
+                        "Remove one first.",
+                    }
+                if sum(1 for v in context.values() if v.get("kind") == "image") >= MAX_CONTEXT_IMAGES:
+                    return {
+                        "status": "error",
+                        "message": f"This chat already has {MAX_CONTEXT_IMAGES} images. Remove one first.",
+                    }
+            context[filename] = {
+                "kind": "image",
+                "media_type": media_type,
+                "data": data_b64,
+                "bytes": size,
+                "chars": 0,
+                "truncated": False,
+                "added_at": time.time(),
+            }
+        logger.info("[chat %s] image %s attached (%d bytes)", chat_id[:8], filename, size)
+        return {"status": "success", "filename": filename, "message": f"{filename} attached to this chat"}
+
+    def get_images(self, chat_id: str) -> List[Dict[str, str]]:
+        with self._lock:
+            chat = self._chats.get(chat_id)
+            if not chat:
+                return []
+            entries = sorted(chat["context"].items(), key=lambda kv: kv[1]["added_at"])
+            return [
+                {"filename": name, "media_type": e["media_type"], "data": e["data"]}
+                for name, e in entries
+                if e.get("kind") == "image"
+            ]
+
     def list_context(self, chat_id: str) -> List[Dict[str, Any]]:
         with self._lock:
             chat = self._touch(chat_id)
             return [
                 {
                     "filename": name,
+                    "kind": entry.get("kind", "text"),
+                    "bytes": entry.get("bytes"),
                     "chars": entry["chars"],
                     "truncated": entry["truncated"],
                     "added_at": entry["added_at"],
@@ -193,7 +245,12 @@ class ChatStore:
             if not chat or not chat["context"]:
                 return ""
             entries = sorted(chat["context"].items(), key=lambda kv: kv[1]["added_at"])
-            return "\n\n".join(f"[File: {name}]\n{entry['text']}" for name, entry in entries)
+            return "\n\n".join(
+                f"[Image: {name}] (attached; you can see it with the user's message)"
+                if entry.get("kind") == "image"
+                else f"[File: {name}]\n{entry['text']}"
+                for name, entry in entries
+            )
 
     # ── whole-chat lifecycle ─────────────────────────────────────────────────
 

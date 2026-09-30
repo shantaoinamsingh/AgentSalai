@@ -181,8 +181,25 @@ def _split_system(messages: List[Dict[str, Any]]) -> tuple:
         elif role == "assistant" and m.get("_anthropic_content") is not None:
             turns.append({"role": "assistant", "content": m["_anthropic_content"]})
         elif role in ("user", "assistant"):
-            turns.append({"role": role, "content": m["content"]})
+            turns.append({"role": role, "content": _anthropic_parts(m["content"])})
     return "\n\n".join(system_chunks), turns
+
+
+def _anthropic_parts(content: Any) -> Any:
+    """Convert OpenAI-style content parts (text + data-URI images) to Anthropic blocks."""
+    if not isinstance(content, list):
+        return content
+    blocks = []
+    for part in content:
+        if part.get("type") == "image_url":
+            header, _, data = part["image_url"]["url"].partition(",")
+            media_type = header.removeprefix("data:").split(";")[0]
+            blocks.append(
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+            )
+        else:
+            blocks.append({"type": "text", "text": part.get("text", "")})
+    return blocks
 
 
 # ─── OpenAI-compatible (OpenAI, OpenRouter, Ollama, vLLM, ...) ────────────────

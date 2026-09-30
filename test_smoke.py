@@ -409,16 +409,71 @@ def test_chat_endpoints_need_no_admin_key(client):
     assert response.get_json()["status"] == "success"
 
 
-def test_chat_upload_rejects_unsupported_type(client):
+def test_chat_upload_accepts_any_type(client):
+    """Unreadable binaries attach as a description; their bytes never reach the prompt."""
     import io
 
+    from chat_store import chat_store
+
+    client.post("/chat/new")
     response = client.post(
         "/chat/upload_context",
-        data={"file": (io.BytesIO(b"MZ"), "malware.exe")},
+        data={"file": (io.BytesIO(b"MZ\x00\x00\x90binary"), "tool.exe")},
         content_type="multipart/form-data",
     )
-    assert response.status_code == 400
-    assert "Unsupported" in response.get_json()["message"]
+    assert response.status_code == 200, response.get_json()
+    with client.session_transaction() as s:
+        chat_id = s["chat_id"]
+    context = chat_store.build_context_text(chat_id)
+    assert "tool.exe" in context and "could not be read" in context
+    assert "binary" not in context
+
+
+def test_chat_upload_reads_text_like_files_of_any_extension(client):
+    import io
+
+    from chat_store import chat_store
+
+    client.post("/chat/new")
+    client.post(
+        "/chat/upload_context",
+        data={"file": (io.BytesIO(b'{"campaign": "Q3 launch"}'), "config.json")},
+        content_type="multipart/form-data",
+    )
+    with client.session_transaction() as s:
+        chat_id = s["chat_id"]
+    assert '"campaign": "Q3 launch"' in chat_store.build_context_text(chat_id)
+
+
+def test_pasted_image_is_sent_to_the_model_as_an_image(client):
+    import io
+
+    import app as app_module
+    import providers
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    client.post("/chat/new")
+    response = client.post(
+        "/chat/upload_context",
+        data={"file": (io.BytesIO(png), "pasted-120000.png")},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200, response.get_json()
+    listing = client.get("/chat/list_context").get_json()["files"]
+    assert listing[0]["kind"] == "image"
+
+    with client.session_transaction() as s:
+        chat_id = s["chat_id"]
+    with app_module.app.test_request_context("/"):
+        messages, meta = app_module.build_messages(chat_id, "what is in this screenshot?")
+    parts = messages[-1]["content"]
+    assert parts[0] == {"type": "text", "text": "what is in this screenshot?"}
+    assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    # Anthropic gets the same image as a base64 image block.
+    _, turns = providers._split_system(messages)
+    block = turns[-1]["content"][1]
+    assert block["type"] == "image" and block["source"]["media_type"] == "image/png"
 
 
 def test_chat_upload_requires_a_file(client):
@@ -885,3 +940,60 @@ def test_tool_loop_executes_calls_and_returns_final_answer(monkeypatch):
     assert executed[0][1]["session_id"] == "chat-123"
     assert "session_id" not in seen_tools[0][0]["parameters"]["properties"]
     assert messages[-1] == {"role": "tool", "tool_call_id": "t1", "content": "Browser opened"}
+
+
+def test_untrusted_site_prompts_and_respects_each_decision(monkeypatch, tmp_path):
+    import app as app_module
+    import browser_tools as bt
+
+    if not app_module.HAS_BROWSER_TOOLS:
+        pytest.skip("browser tools not installed")
+
+    mgr = app_module.browser_manager
+    monkeypatch.setattr(bt, "TRUSTED_DOMAINS_FILE", str(tmp_path / "trusted.json"))
+    monkeypatch.setattr(mgr, "trusted", {"example.com"})
+    monkeypatch.setattr(mgr, "session_approvals", {})
+    asked = []
+
+    def asker(decision):
+        return lambda domain, url: (asked.append(domain), decision)[1]
+
+    check = app_module._check_site_access
+    # Trusted sites and their subdomains never prompt.
+    assert check("https://www.example.com/x", "c1", asker("deny")) is None
+    assert asked == []
+
+    # Deny is reported back to the model, nothing is remembered.
+    assert "declined" in check("https://news.ycombinator.com", "c1", asker("deny"))
+    assert not mgr.is_trusted("https://news.ycombinator.com", "c1")
+
+    # Allow once covers only this chat.
+    assert check("https://news.ycombinator.com", "c1", asker("once")) is None
+    assert mgr.is_trusted("https://news.ycombinator.com", "c1")
+    assert not mgr.is_trusted("https://news.ycombinator.com", "c2")
+
+    # Always allow applies to every chat and is saved to disk.
+    assert check("https://reddit.com/r/python", "c2", asker("always")) is None
+    assert mgr.is_trusted("https://old.reddit.com", "c3")
+    assert "reddit.com" in (tmp_path / "trusted.json").read_text()
+
+    # No way to ask (e.g. not a live chat) means no access.
+    assert "declined" in check("https://unknown-site.dev", "c1", None)
+    # Look-alike domains are not covered by a trusted one.
+    assert not mgr.is_trusted("https://evilexample.com", "c1")
+
+
+def test_permission_answer_only_accepted_from_the_asking_tab():
+    import threading
+    import app as app_module
+
+    entry = {"sid": "tab-a", "event": threading.Event(), "decision": "deny"}
+    app_module._pending_permissions["req1"] = entry
+    client_b = app_module.socketio.test_client(app_module.app)
+    try:
+        client_b.emit("browser_permission_response", {"id": "req1", "decision": "always"})
+        assert not entry["event"].is_set()
+        assert entry["decision"] == "deny"
+    finally:
+        app_module._pending_permissions.pop("req1", None)
+        client_b.disconnect()

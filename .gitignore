@@ -45,3 +45,6 @@ uploads/
 screenshots/
 # Per-user Claude Code settings
 .claude/settings.local.json
+
+# Domains the user chose to always allow for browser tools
+trusted_domains.json

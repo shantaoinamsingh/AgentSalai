@@ -31,10 +31,9 @@ openpyxl==3.1.5
 # OpenRouter and self-hosted providers are plain HTTP and need nothing extra.
 anthropic==0.107.1
 
-# Optional: Browser automation tools (for web browsing agent)
-# Install with: pip install playwright or pip install selenium
-# playwright==1.40.0
-# selenium==4.15.2
+# Browser automation tools. After installing, run: python -m playwright install chromium
+playwright==1.63.0
 
 # Tests
 pytest==9.0.3
+pytest-asyncio==1.4.0

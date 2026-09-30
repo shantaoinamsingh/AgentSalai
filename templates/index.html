@@ -477,6 +477,40 @@
             background: #e0e0e0;
         }
 
+        #voiceBtn.listening {
+            background: #e53935;
+            color: white;
+            animation: voicePulse 1.2s ease-in-out infinite;
+        }
+
+        @keyframes voicePulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(229, 57, 53, 0.5); }
+            50% { box-shadow: 0 0 0 8px rgba(229, 57, 53, 0); }
+        }
+
+        .permission-card .permission-url {
+            font-size: 0.85rem;
+            color: #666;
+            word-break: break-all;
+            margin: 0.35rem 0 0.75rem;
+        }
+
+        .permission-card .permission-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .permission-card .btn {
+            padding: 0.45rem 1rem;
+            font-size: 0.9rem;
+        }
+
+        .permission-card .permission-result {
+            font-style: italic;
+            color: #666;
+        }
+
         .typing {
             display: none;
             padding: 0.5rem 1rem;
@@ -839,10 +873,9 @@
             <textarea id="message" rows="1" placeholder="Type your message…  (Shift+Enter for a new line)"></textarea>
 
             <!-- Attach to this chat: one click, straight to the file picker. -->
-            <input type="file" id="chatFileInput" multiple
-                   accept=".txt,.md,.csv,.pdf,.docx,.doc" style="display:none">
+            <input type="file" id="chatFileInput" multiple style="display:none">
             <button class="attach-btn" id="attachBtn" onclick="document.getElementById('chatFileInput').click()"
-                    title="Attach a file to this chat">
+                    title="Attach a file to this chat (or paste one with Ctrl+V)">
                 <i class="fas fa-paperclip"></i>
                 <span class="attach-count" id="attachCount"></span>
             </button>
@@ -850,7 +883,7 @@
             <button class="btn btn-primary" onclick="sendMessage()">
                 <i class="fas fa-paper-plane"></i> Send
             </button>
-            <button class="btn btn-secondary" onclick="startVoice()" title="Voice input">
+            <button class="btn btn-secondary" id="voiceBtn" onclick="startVoice()" title="Voice input">
                 <i class="fas fa-microphone"></i>
             </button>
         </div>
@@ -963,6 +996,63 @@
             addMessage('bot', data.result, data.command);
         });
 
+        // The agent pauses and asks before opening a site that is not trusted yet.
+        socket.on('browser_permission_request', function(req) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message bot permission-card';
+            const avatar = document.createElement('div');
+            avatar.className = 'avatar';
+            avatar.innerHTML = '<i class="fas fa-globe"></i>';
+            const box = document.createElement('div');
+            box.className = 'message-content';
+
+            const title = document.createElement('div');
+            const strong = document.createElement('strong');
+            strong.textContent = req.domain;
+            title.append('Salai wants to open ', strong, '. Allow it?');
+            const url = document.createElement('div');
+            url.className = 'permission-url';
+            url.textContent = req.url;
+            const actions = document.createElement('div');
+            actions.className = 'permission-actions';
+
+            const labels = {
+                once: 'Allowed for this chat',
+                always: 'Always allowed',
+                deny: 'Declined',
+                expired: 'No answer in time, so the site was skipped',
+            };
+            let answered = false;
+            function settle(decision) {
+                if (answered) return;
+                answered = true;
+                clearTimeout(timer);
+                if (decision !== 'expired') {
+                    socket.emit('browser_permission_response', {id: req.id, decision: decision});
+                }
+                actions.replaceChildren();
+                const result = document.createElement('span');
+                result.className = 'permission-result';
+                result.textContent = labels[decision];
+                actions.appendChild(result);
+            }
+            [['once', 'Allow once', 'btn-primary'],
+             ['always', 'Always allow', 'btn-secondary'],
+             ['deny', 'Deny', 'btn-secondary']].forEach(([decision, label, cls]) => {
+                const b = document.createElement('button');
+                b.className = `btn ${cls}`;
+                b.textContent = label;
+                b.onclick = () => settle(decision);
+                actions.appendChild(b);
+            });
+            const timer = setTimeout(() => settle('expired'), (req.timeout || 120) * 1000);
+
+            box.append(title, url, actions);
+            messageDiv.append(avatar, box);
+            chat.insertBefore(messageDiv, typingIndicator.parentNode === chat ? typingIndicator : null);
+            chat.scrollTop = chat.scrollHeight;
+        });
+
         function addMessage(type, content, originalCommand = '') {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${type}`;
@@ -1023,33 +1113,78 @@
             typingIndicator.style.display = 'none';
         }
 
+        // ── Voice input ────────────────────────────────────────────────────
+        // Click to talk, click again to stop. Words appear as you speak and
+        // the message sends when you pause.
+        const defaultPlaceholder = messageInput.placeholder;
+        const VOICE_ERRORS = {
+            'not-allowed': 'Microphone access is blocked. Allow it from the icon in the address bar, then try again.',
+            'service-not-allowed': 'Microphone access is blocked. Allow it from the icon in the address bar, then try again.',
+            'audio-capture': 'No microphone was found. Check that one is connected and enabled.',
+            'no-speech': 'Didn’t hear anything. Click the mic and speak again.',
+            'network': 'The speech service could not be reached. Your browser sends audio to an online service, which may be blocked on this network.',
+            'language-not-supported': 'Voice input does not support your browser language.',
+        };
+        let recognition = null;
+
+        function setListening(on) {
+            const btn = document.getElementById('voiceBtn');
+            btn.classList.toggle('listening', on);
+            btn.title = on ? 'Stop listening' : 'Voice input';
+            messageInput.placeholder = on ? 'Listening… (click the mic again to stop)' : defaultPlaceholder;
+        }
+
         function startVoice() {
-            // Voice recognition implementation
-            if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-                const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
-                recognition.lang = 'en-US';
-                recognition.interimResults = false;
+            if (recognition) {  // second click stops
+                recognition.stop();
+                return;
+            }
+            const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!Recognition) {
+                showToast('Voice input needs Chrome or Edge. This browser does not support it.', 'error');
+                return;
+            }
+            if (!window.isSecureContext) {
+                showToast('Voice input only works on https:// or http://localhost. Open the app at http://localhost:5000.', 'error');
+                return;
+            }
 
-                recognition.onstart = function() {
-                    messageInput.placeholder = 'Listening...';
-                };
+            const rec = new Recognition();
+            rec.lang = navigator.language || 'en-US';
+            rec.interimResults = true;
+            rec.continuous = false;
+            const before = messageInput.value ? messageInput.value.trimEnd() + ' ' : '';
+            let finalText = '';
 
-                recognition.onresult = function(event) {
-                    const transcript = event.results[0][0].transcript;
-                    messageInput.value = transcript;
-                    messageInput.placeholder = 'Type your message...';
-                    sendMessage();
-                };
+            rec.onstart = () => setListening(true);
+            rec.onresult = (event) => {
+                let interim = '';
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    const r = event.results[i];
+                    if (r.isFinal) finalText += r[0].transcript;
+                    else interim += r[0].transcript;
+                }
+                messageInput.value = before + finalText + interim;
+                autoGrow();
+            };
+            rec.onerror = (event) => {
+                if (event.error === 'aborted') return;
+                console.error('Speech recognition error:', event.error);
+                showToast(VOICE_ERRORS[event.error] || `Voice input failed (${event.error}). Please try again.`, 'error');
+            };
+            rec.onend = () => {
+                recognition = null;
+                setListening(false);
+                if (finalText.trim()) sendMessage();
+            };
 
-                recognition.onerror = function(event) {
-                    console.error('Speech recognition error:', event.error);
-                    messageInput.placeholder = 'Type your message...';
-                    alert('Voice recognition failed. Please try again.');
-                };
-
-                recognition.start();
-            } else {
-                alert('Voice recognition is not supported in your browser.');
+            recognition = rec;
+            try {
+                rec.start();
+            } catch (e) {
+                recognition = null;
+                setListening(false);
+                showToast('Could not start voice input. Please try again.', 'error');
             }
         }
 
@@ -1242,8 +1377,9 @@
                 const chip = document.createElement('div');
                 chip.className = 'attachment-chip';
 
+                const isImage = f.kind === 'image';
                 const icon = document.createElement('i');
-                icon.className = 'fas fa-file-alt';
+                icon.className = isImage ? 'fas fa-image' : 'fas fa-file-alt';
                 chip.appendChild(icon);
 
                 const name = document.createElement('span');
@@ -1256,9 +1392,11 @@
 
                 const size = document.createElement('span');
                 size.className = 'chip-size';
-                size.textContent = f.truncated
-                    ? `${f.chars.toLocaleString()}c ✂`
-                    : `${f.chars.toLocaleString()}c`;
+                size.textContent = isImage
+                    ? `${Math.max(1, Math.round((f.bytes || 0) / 1024)).toLocaleString()} KB`
+                    : f.truncated
+                        ? `${f.chars.toLocaleString()}c ✂`
+                        : `${f.chars.toLocaleString()}c`;
                 chip.appendChild(size);
 
                 const remove = document.createElement('span');
@@ -1304,6 +1442,46 @@
             this.value = '';  // allow re-picking the same file later
             if (files.length) attachToChat(files);
         });
+
+        // Paste anything: text goes into the box, screenshots and copied files attach.
+        document.addEventListener('paste', function (e) {
+            const target = e.target;
+            const inOtherField = target !== messageInput &&
+                (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+            if (inOtherField || !e.clipboardData) return;
+
+            const files = Array.from(e.clipboardData.files || []);
+            const text = e.clipboardData.getData('text/plain');
+            // Office apps put a picture of the selection next to the text; keep the text.
+            const realFiles = text ? files.filter(f => !f.type.startsWith('image/')) : files;
+
+            if (realFiles.length) {
+                e.preventDefault();
+                const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, '');
+                attachToChat(realFiles.map((f, i) => {
+                    // Pasted screenshots are all called "image.png"; make names unique.
+                    if (f.name && f.name !== 'image.png') return f;
+                    const ext = (f.type.split('/')[1] || 'bin').replace('jpeg', 'jpg');
+                    return new File([f], `pasted-${stamp}${i ? '-' + i : ''}.${ext}`, { type: f.type });
+                }));
+                if (text && target === messageInput) insertAtCursor(text);
+                return;
+            }
+
+            // Plain text pasted outside the box still lands in it.
+            if (text && target !== messageInput) {
+                e.preventDefault();
+                messageInput.focus();
+                insertAtCursor(text);
+            }
+        });
+
+        function insertAtCursor(text) {
+            const start = messageInput.selectionStart ?? messageInput.value.length;
+            const end = messageInput.selectionEnd ?? start;
+            messageInput.setRangeText(text, start, end, 'end');
+            autoGrow();
+        }
 
         async function attachToChat(files) {
             const attachBtn = document.getElementById('attachBtn');

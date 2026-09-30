@@ -15,14 +15,23 @@ Security Note:
 - Add rate limiting for browser operations
 - Log all browser activities
 """
+import json
 import logging
+import os
 import re
+import threading
 import time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+# Starts as ALLOWED_DOMAINS; "Always allow" in the chat adds to it.
+TRUSTED_DOMAINS_FILE = os.getenv(
+    "BROWSER_TRUSTED_DOMAINS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "trusted_domains.json"),
+)
 
 # Try to import Playwright first (preferred), fall back to Selenium
 try:
@@ -68,7 +77,7 @@ class BrowserContext:
 class BrowserToolManager:
     """Manages browser automation for the chatbot."""
 
-    # Allowed domains to prevent abuse
+    # Initial trusted list. Other domains are not blocked: the user is asked first.
     ALLOWED_DOMAINS = [
         "example.com",
         "facebook.com",
@@ -86,6 +95,7 @@ class BrowserToolManager:
         "dentsu.com",
         "nike.in",
         "addidas.com",
+        "linkedin.com",
     ]
 
     # Blocked keywords in URLs
@@ -107,6 +117,9 @@ class BrowserToolManager:
         """Initialize browser tool manager."""
         self.contexts: Dict[str, BrowserContext] = {}
         self.engine = BROWSER_ENGINE
+        self._trust_lock = threading.Lock()
+        self.trusted = self._load_trusted()
+        self.session_approvals: Dict[str, set] = {}
 
         if not HAS_PLAYWRIGHT and not HAS_SELENIUM:
             logger.warning(
@@ -118,36 +131,59 @@ class BrowserToolManager:
         """Check if browser tools are available."""
         return bool(self.engine)
 
-    def _validate_url(self, url: str) -> bool:
-        """Validate URL is safe to visit."""
-        # Check for blocked keywords
-        if any(keyword in url.lower() for keyword in self.BLOCKED_KEYWORDS):
-            return False
-
-        # Parse URL
-        try:
-            parsed = urlparse(url)
-        except Exception:
-            return False
-
+    @staticmethod
+    def domain_of(url: str) -> str:
         # "host:port" parses as a scheme, so test for "://" instead.
         if "://" not in url:
             url = f"https://{url}"
-            parsed = urlparse(url)
+        try:
+            return (urlparse(url).hostname or "").lower()
+        except ValueError:
+            return ""
 
-        # Check domain
-        domain = (parsed.hostname or "").lower()
+    def is_safe_url(self, url: str) -> bool:
+        """Hard safety checks that no user approval can override."""
+        if any(keyword in url.lower() for keyword in self.BLOCKED_KEYWORDS):
+            return False
+        if "://" in url and not url.lower().startswith(("http://", "https://")):
+            return False
+        return bool(self.domain_of(url))
 
-        # Allow localhost for testing
+    def _load_trusted(self) -> set:
+        try:
+            with open(TRUSTED_DOMAINS_FILE, encoding="utf-8") as f:
+                return {d.lower() for d in json.load(f)}
+        except FileNotFoundError:
+            return set(self.ALLOWED_DOMAINS)
+        except (OSError, ValueError) as e:
+            logger.error(f"Could not read {TRUSTED_DOMAINS_FILE}: {e}; using defaults")
+            return set(self.ALLOWED_DOMAINS)
+
+    def trusted_domains(self) -> List[str]:
+        return sorted(self.trusted)
+
+    def trust_domain(self, domain: str) -> None:
+        """Trust a domain for every chat, persisted across restarts."""
+        with self._trust_lock:
+            self.trusted.add(domain.lower())
+            with open(TRUSTED_DOMAINS_FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(self.trusted), f, indent=2)
+        logger.info(f"Domain trusted permanently: {domain}")
+
+    def approve_domain(self, session_id: str, domain: str) -> None:
+        """Allow a domain for one browser session only."""
+        self.session_approvals.setdefault(session_id, set()).add(domain.lower())
+
+    def is_trusted(self, url: str, session_id: Optional[str] = None) -> bool:
+        domain = self.domain_of(url)
         if domain in ("localhost", "127.0.0.1", "0.0.0.0"):
             return True
+        allowed = self.trusted | self.session_approvals.get(session_id, set())
+        return any(domain == d or domain.endswith("." + d) for d in allowed)
 
-        for allowed in self.ALLOWED_DOMAINS:
-            if domain == allowed or domain.endswith("." + allowed):
-                return True
-
-        logger.warning(f"Domain not in whitelist: {domain}")
-        return False
+    def _validate_url(self, url: str, session_id: Optional[str] = None) -> bool:
+        """True when the URL is safe and trusted (or approved for this session)."""
+        return self.is_safe_url(url) and self.is_trusted(url, session_id)
 
     async def open_browser(self, session_id: str, headless: bool = True) -> str:
         """Open a new browser instance.
@@ -227,8 +263,13 @@ class BrowserToolManager:
         if session_id not in self.contexts:
             return "Browser not open. Use open_browser first."
 
-        if not self._validate_url(url):
-            return f"URL not allowed: {url}"
+        if not self.is_safe_url(url):
+            return f"URL not allowed (blocked as unsafe): {url}"
+        if not self.is_trusted(url, session_id):
+            return (
+                f"URL not allowed yet: {self.domain_of(url)} is not a trusted domain "
+                "and needs the user's approval."
+            )
 
         # Ensure URL has scheme
         if not url.startswith(("http://", "https://")):

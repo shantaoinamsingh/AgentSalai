@@ -17,6 +17,7 @@ Two session identities, also deliberately separate:
 * ``user_id`` -- stable for the browser; keys provider settings and API keys,
   which must survive starting a new conversation.
 """
+import base64
 import copy
 import functools
 import hmac
@@ -38,6 +39,7 @@ load_dotenv()
 
 import exporters  # noqa: E402
 import providers  # noqa: E402
+import chat_store as chat_store_limits  # noqa: E402
 from chat_store import chat_store  # noqa: E402
 from knowledge_base import SUPPORTED_EXTENSIONS, kb  # noqa: E402
 from settings_store import OUTPUT_FORMATS, settings_store  # noqa: E402
@@ -50,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 try:
     from agent import agent_executor, run_sync as run_agent_sync
+    from browser_tools import browser_tools as browser_manager
 
     HAS_BROWSER_TOOLS = bool(agent_executor.get_available_tools())
 except ImportError:
@@ -60,6 +63,8 @@ if not HAS_BROWSER_TOOLS:
 # Visible by default so a local user can watch the agent work.
 BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "false").lower() in ("1", "true", "yes")
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", 15))
+# How long to wait for the user to answer a site-access prompt before declining.
+PERMISSION_TIMEOUT = int(os.getenv("BROWSER_PERMISSION_TIMEOUT", 120))
 MAX_TOOL_RESULT_CHARS = 4000
 
 # Only these are needed to boot. Provider credentials are not required since
@@ -109,7 +114,8 @@ unless the user asks you to close it. To search the web, navigate straight to
 https://www.bing.com/search?q=your+query (Google and DuckDuckGo block automated
 browsers with a CAPTCHA) rather than filling a search box. The navigate result
 includes the page text, so read results from it.
-Only whitelisted domains can be opened; if a navigation is refused, tell the user.
+Any site can be requested: the app asks the user before opening a site that is not
+yet trusted, so never refuse up front. If the user declines, respect that and do not retry.
 """
 
 app = Flask(__name__)
@@ -268,11 +274,22 @@ def build_messages(
 
     messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
     messages.extend(chat_store.get_history(chat_id))
-    messages.append({"role": "user", "content": user_input})
+
+    images = chat_store.get_images(chat_id)
+    if images:
+        # OpenAI-style parts; providers.py converts them for Anthropic.
+        content: Any = [{"type": "text", "text": user_input}] + [
+            {"type": "image_url", "image_url": {"url": f"data:{i['media_type']};base64,{i['data']}"}}
+            for i in images
+        ]
+    else:
+        content = user_input
+    messages.append({"role": "user", "content": content})
+    meta["chat_images"] = len(images)
     return messages, meta
 
 
-def get_answer(user_input: str, chat_id: str, user_id: str) -> str:
+def get_answer(user_input: str, chat_id: str, user_id: str, ask_permission=None) -> str:
     """Run one conversation turn and persist it to the chat's history.
 
     With browser tools support, the agent can browse websites, take screenshots,
@@ -306,7 +323,9 @@ def get_answer(user_input: str, chat_id: str, user_id: str) -> str:
     )
     try:
         if HAS_BROWSER_TOOLS and providers.supports_tools(provider_id):
-            answer = _run_tool_loop(provider_id, settings["model"], messages, chat_id, chat_kwargs)
+            answer = _run_tool_loop(
+                provider_id, settings["model"], messages, chat_id, chat_kwargs, ask_permission
+            )
         else:
             answer = providers.chat(provider_id, settings["model"], messages, **chat_kwargs)
     except providers.ProviderError as e:
@@ -336,7 +355,28 @@ def _browser_tool_defs() -> list:
     return defs
 
 
-def _run_tool_loop(provider_id: str, model: str, messages: list, chat_id: str, chat_kwargs: dict) -> str:
+def _check_site_access(url: str, chat_id: str, ask_permission) -> Optional[str]:
+    """Ask the user before visiting an untrusted site. Returns a refusal, or None to proceed."""
+    if not browser_manager.is_safe_url(url) or browser_manager.is_trusted(url, chat_id):
+        return None  # unsafe URLs are refused by navigate itself
+    domain = browser_manager.domain_of(url)
+    decision = ask_permission(domain, url) if ask_permission else "deny"
+    logger.info("[chat %s] site access %s -> %s", chat_id[:8], domain, decision)
+    if decision == "always":
+        browser_manager.trust_domain(domain)
+    elif decision == "once":
+        browser_manager.approve_domain(chat_id, domain)
+    else:
+        return (
+            f"The user declined access to {domain}. Do not retry this site; "
+            "try another source or tell the user what you could not do."
+        )
+    return None
+
+
+def _run_tool_loop(
+    provider_id: str, model: str, messages: list, chat_id: str, chat_kwargs: dict, ask_permission=None
+) -> str:
     """Let the model call browser tools until it produces a final answer."""
     tools = _browser_tool_defs()
     for _ in range(MAX_TOOL_ROUNDS):
@@ -353,7 +393,12 @@ def _run_tool_loop(provider_id: str, model: str, messages: list, chat_id: str, c
                 args["headless"] = BROWSER_HEADLESS
             logger.info("[chat %s] tool %s %s", chat_id[:8], call["name"], {k: v for k, v in args.items() if k != "session_id"})
             try:
-                result = run_agent_sync(agent_executor.execute_tool(call["name"], args, chat_id))
+                refusal = None
+                if call["name"] == "navigate" and args.get("url"):
+                    refusal = _check_site_access(str(args["url"]), chat_id, ask_permission)
+                result = refusal or run_agent_sync(
+                    agent_executor.execute_tool(call["name"], args, chat_id)
+                )
             except Exception as e:
                 logger.exception("[chat %s] tool %s failed", chat_id[:8], call["name"])
                 result = f"Error: {e}"
@@ -596,27 +641,106 @@ def chat_upload_context():
     embedding work to wait on.
     """
     chat_id = current_chat_id()
-    file, error = _validated_upload()
-    if error:
-        return error
+    file = request.files.get("file")
+    if file is None or not file.filename:
+        return jsonify(status="error", message="No file provided in the request"), 400
+    filename = os.path.basename(file.filename)
 
     tmp_path = _spool_to_temp(file)
     try:
-        text = kb.extract_text(tmp_path)
+        image_type = _vision_media_type(tmp_path)
+        if image_type:
+            with open(tmp_path, "rb") as f:
+                raw = f.read()
+            result = chat_store.add_image(
+                chat_id, filename, image_type, base64.b64encode(raw).decode("ascii"), len(raw)
+            )
+        else:
+            text = _extract_chat_file(tmp_path, filename, file.mimetype)
+            result = chat_store.add_context(chat_id, filename, text)
     finally:
         try:
             os.remove(tmp_path)
         except OSError:
             pass
 
-    if not text.strip():
-        return jsonify(
-            status="error",
-            message="No extractable text found (scanned or image-only PDFs are not supported)",
-        ), 400
-
-    result = chat_store.add_context(chat_id, os.path.basename(file.filename), text)
     return jsonify(result), 200 if result["status"] == "success" else 400
+
+
+# Formats all vision providers accept (OpenAI, Anthropic, Gemini).
+_VISION_TYPES = {
+    b"\x89PNG\r\n\x1a\n": "image/png",
+    b"\xff\xd8\xff": "image/jpeg",
+    b"GIF87a": "image/gif",
+    b"GIF89a": "image/gif",
+}
+
+
+def _vision_media_type(path: str) -> Optional[str]:
+    """Detect a model-viewable image from its bytes, not its (possibly missing) name."""
+    with open(path, "rb") as f:
+        head = f.read(16)
+    for magic, media_type in _VISION_TYPES.items():
+        if head.startswith(magic):
+            return media_type
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _extract_chat_file(path: str, filename: str, mimetype: str) -> str:
+    """Best-effort text for any file type. Never empty: unreadable files get a description."""
+    ext = os.path.splitext(filename)[1].lower()
+    text = ""
+    if ext in SUPPORTED_EXTENSIONS:
+        text = kb.extract_text(path)
+    elif ext in (".xlsx", ".xlsm"):
+        text = _extract_workbook(path)
+    else:
+        text = _read_if_text(path)
+
+    if text.strip():
+        return text
+    size = os.path.getsize(path)
+    kind = mimetype or "unknown type"
+    note = " It may be a scanned document." if ext == ".pdf" else ""
+    return (
+        f"(The user attached {filename}, {size:,} bytes, {kind}. Its contents could not be "
+        f"read as text.{note} Tell the user if you need it in another format.)"
+    )
+
+
+def _read_if_text(path: str) -> str:
+    """Decode files that are really text (code, JSON, XML, logs...) regardless of extension."""
+    with open(path, "rb") as f:
+        raw = f.read(chat_store_limits.MAX_CONTEXT_CHARS_PER_FILE * 4)
+    if b"\x00" in raw[:8192]:
+        return ""
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def _extract_workbook(path: str) -> str:
+    from openpyxl import load_workbook
+
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+    except Exception as e:
+        logger.warning("Could not open workbook %s: %s", path, e)
+        return ""
+    parts = []
+    for ws in wb.worksheets:
+        rows = [
+            "\t".join("" if v is None else str(v) for v in row)
+            for row in ws.iter_rows(values_only=True)
+            if any(v is not None for v in row)
+        ]
+        if rows:
+            parts.append(f"## Sheet: {ws.title}\n" + "\n".join(rows))
+    wb.close()
+    return "\n\n".join(parts)
 
 
 @app.route("/chat/list_context", methods=["GET"])
@@ -670,6 +794,56 @@ def _run_off_hub(fn, *args):
     return fn(*args)
 
 
+# Site-access prompts awaiting an answer: request id -> {sid, event, decision}.
+_pending_permissions: Dict[str, Dict[str, Any]] = {}
+_PERMISSION_DECISIONS = ("once", "always", "deny")
+
+
+def _make_permission_asker(sid: str):
+    """Build a blocking prompt that runs on the worker thread handling this turn."""
+    hub = None
+    if socketio.async_mode in ("gevent", "gevent_uwsgi"):
+        import gevent
+
+        hub = gevent.get_hub()  # captured on the hub thread, used from the worker
+
+    def ask(domain: str, url: str) -> str:
+        request_id = uuid.uuid4().hex
+        entry = {"sid": sid, "event": threading.Event(), "decision": "deny"}
+        _pending_permissions[request_id] = entry
+        payload = {"id": request_id, "domain": domain, "url": url, "timeout": PERMISSION_TIMEOUT}
+
+        def send():
+            socketio.emit("browser_permission_request", payload, to=sid)
+
+        if hub is not None:
+            # Socket writes must happen on the hub thread, in a greenlet.
+            import gevent
+
+            hub.loop.run_callback_threadsafe(gevent.spawn, send)
+        else:
+            send()
+        try:
+            entry["event"].wait(PERMISSION_TIMEOUT)
+            return entry["decision"]
+        finally:
+            _pending_permissions.pop(request_id, None)
+
+    return ask
+
+
+@socketio.on("browser_permission_response")
+def handle_browser_permission_response(data):
+    data = data or {}
+    entry = _pending_permissions.get(str(data.get("id", "")))
+    # Only the tab that was asked may answer.
+    if entry is None or entry["sid"] != request.sid:
+        return
+    decision = data.get("decision")
+    entry["decision"] = decision if decision in _PERMISSION_DECISIONS else "deny"
+    entry["event"].set()
+
+
 @socketio.on("voice_command")
 def handle_voice_command(data):
     command = (data or {}).get("command", "")
@@ -677,7 +851,9 @@ def handle_voice_command(data):
     user_id = current_user_id()
     logger.info("[chat %s] received: %.80s", chat_id[:8], command)
     try:
-        response = _run_off_hub(get_answer, command, chat_id, user_id)
+        response = _run_off_hub(
+            get_answer, command, chat_id, user_id, _make_permission_asker(request.sid)
+        )
     except Exception:
         logger.exception("Unhandled error answering a message")
         response = "Something went wrong handling that message. Please try again."
