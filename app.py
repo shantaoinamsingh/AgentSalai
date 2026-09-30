@@ -23,6 +23,7 @@ import functools
 import hmac
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -63,6 +64,7 @@ if not HAS_BROWSER_TOOLS:
 # Visible by default so a local user can watch the agent work.
 BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "false").lower() in ("1", "true", "yes")
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", 15))
+WEB_SEARCH_FALLBACK = os.getenv("WEB_SEARCH_FALLBACK", "true").lower() in ("1", "true", "yes")
 # How long to wait for the user to answer a site-access prompt before declining.
 PERMISSION_TIMEOUT = int(os.getenv("BROWSER_PERMISSION_TIMEOUT", 120))
 MAX_TOOL_RESULT_CHARS = 4000
@@ -332,13 +334,46 @@ def get_answer(user_input: str, chat_id: str, user_id: str, ask_permission=None)
         # These messages are written to be shown to the user, and the provider
         # layer keeps raw response bodies (which can echo the API key) out.
         logger.error("[chat %s] provider %s failed: %s", chat_id[:8], provider_id, e)
-        return f"⚠️ {e}"
+        return f"⚠️ {e}" + _web_search_fallback(user_input, chat_id)
 
     # Record both sides of the turn. The old code stored only the assistant
     # message, which produced a malformed, assistant-only "conversation".
     chat_store.append_message(chat_id, "user", user_input)
     chat_store.append_message(chat_id, "assistant", answer)
     return answer
+
+
+def _md_escape(text: str) -> str:
+    """Neutralise web text for the Markdown renderer, which does not sanitise HTML."""
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return re.sub(r"([\\`*_\[\]()#|!~])", r"\\\1", text)
+
+
+def _web_search_fallback(user_input: str, chat_id: str) -> str:
+    """When the model is unavailable, answer with raw web results instead of nothing."""
+    if not (WEB_SEARCH_FALLBACK and HAS_BROWSER_TOOLS):
+        return ""
+    query = " ".join(user_input.split())[:200]
+    try:
+        results = run_agent_sync(browser_manager.web_search(query), timeout=60)
+    except Exception as e:
+        logger.warning("[chat %s] web search fallback failed: %s", chat_id[:8], e)
+        return "\n\nI also tried a web search for your question, but it failed. Please try again shortly."
+    if not results:
+        return "\n\nI also searched the web for your question but found no results."
+
+    lines = [
+        "\n\nThe AI model is unavailable, so here are the top web results for your question "
+        "(not summarised; check the sources):\n"
+    ]
+    for n, r in enumerate(results, 1):
+        url = r["url"].replace(" ", "%20").replace("(", "%28").replace(")", "%29").replace("<", "%3C").replace(">", "%3E")
+        line = f"{n}. **[{_md_escape(r['title'])}]({url})**"
+        if r["snippet"]:
+            line += f"  \n   {_md_escape(r['snippet'])}"
+        lines.append(line)
+    logger.info("[chat %s] answered from web search (%d results)", chat_id[:8], len(results))
+    return "\n".join(lines)
 
 
 def _browser_tool_defs() -> list:

@@ -997,3 +997,50 @@ def test_permission_answer_only_accepted_from_the_asking_tab():
     finally:
         app_module._pending_permissions.pop("req1", None)
         client_b.disconnect()
+
+
+def test_bing_redirect_links_are_unwrapped():
+    from browser_tools import _unwrap_bing_link
+
+    wrapped = "https://www.bing.com/ck/a?!&&p=abc&u=a1aHR0cHM6Ly9lbi53aWtpcGVkaWEub3JnL3dpa2kvQ2FuYmVycmE&ntb=1"
+    assert _unwrap_bing_link(wrapped) == "https://en.wikipedia.org/wiki/Canberra"
+    assert _unwrap_bing_link("https://example.com/x") == "https://example.com/x"
+
+
+def _fallback_setup(monkeypatch, search):
+    import app as app_module
+
+    if not app_module.HAS_BROWSER_TOOLS:
+        pytest.skip("browser tools not installed")
+    monkeypatch.setattr(app_module.browser_manager, "web_search", search)
+    return app_module
+
+
+def test_model_failure_still_answers_from_web_search(monkeypatch):
+    async def search(query, max_results=5):
+        assert query == "capital of australia"
+        return [
+            {"title": "Canberra - Wikipedia", "url": "https://en.wikipedia.org/wiki/Canberra",
+             "snippet": "Canberra is the capital."},
+            {"title": "<img src=x onerror=alert(1)>", "url": "https://evil.example/a b",
+             "snippet": "[click](javascript:alert(1))"},
+        ]
+
+    app_module = _fallback_setup(monkeypatch, search)
+    # A fresh user has no API key, so the provider call itself fails.
+    answer = app_module.get_answer("capital of australia", "fallback-chat", "fallback-user")
+
+    assert answer.startswith("⚠️ ") and "API key" in answer
+    assert "[Canberra - Wikipedia](https://en.wikipedia.org/wiki/Canberra)" in answer
+    assert "<img" not in answer and "&lt;img" in answer
+    assert "](javascript:" not in answer
+    assert "https://evil.example/a%20b" in answer
+
+
+def test_web_search_fallback_reports_its_own_failure(monkeypatch):
+    async def search(query, max_results=5):
+        raise RuntimeError("network down")
+
+    app_module = _fallback_setup(monkeypatch, search)
+    answer = app_module.get_answer("anything", "fallback-chat-2", "fallback-user-2")
+    assert "API key" in answer and "web search" in answer and "failed" in answer

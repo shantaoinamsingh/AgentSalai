@@ -23,7 +23,8 @@ import threading
 import time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
-from urllib.parse import urlparse
+import base64
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -491,6 +492,45 @@ class BrowserToolManager:
             logger.error(f"Close error: {e}")
             return f"Error closing browser: {e}"
 
+    async def web_search(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
+        """Top Bing results as {title, url, snippet}, in a throwaway headless browser.
+
+        Needs no LLM, so it still works when the model provider is down.
+        """
+        if self.engine != "playwright":
+            raise BrowserToolError("Web search needs Playwright (pip install playwright)")
+        url = f"https://www.bing.com/search?q={quote_plus(query)}"
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                # Bing now and then serves a page with no results, a half-rendered
+                # one, or reloads itself (&rdr=1) mid-read. A fresh request fixes all three.
+                for _ in range(3):
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=self.PAGE_LOAD_TIMEOUT * 1000)
+                        await page.wait_for_selector("li.b_algo", timeout=8_000)
+                        items = await page.eval_on_selector_all(
+                            "li.b_algo",
+                            """els => els.map(e => ({
+                                title: e.querySelector('h2')?.innerText || '',
+                                url: e.querySelector('h2 a')?.href || '',
+                                snippet: (e.querySelector('.b_caption p') || e.querySelector('p'))?.innerText || ''
+                            }))""",
+                        )
+                        results = _parse_search_items(items, max_results)
+                        if results:
+                            return results
+                        logger.info("Bing results page had no readable results; retrying")
+                    except Exception as e:
+                        logger.info(
+                            f"Bing results not readable yet ({e.__class__.__name__}) "
+                            f"at {page.url[:120]!r}; retrying"
+                        )
+                return []
+            finally:
+                await browser.close()
+
     def get_available_tools(self) -> List[Dict[str, Any]]:
         """Get list of available browser tools for the LLM."""
         if not self.is_available():
@@ -628,4 +668,31 @@ class BrowserToolManager:
 
 
 # Global instance
+def _parse_search_items(items: List[Dict[str, str]], max_results: int) -> List[Dict[str, str]]:
+    results = []
+    for item in items:
+        link = _unwrap_bing_link(item.get("url", ""))
+        title = " ".join(item.get("title", "").split())
+        if title and link.startswith(("http://", "https://")):
+            results.append({"title": title, "url": link, "snippet": " ".join(item.get("snippet", "").split())})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _unwrap_bing_link(href: str) -> str:
+    """Bing result links are click-tracking redirects; the target is base64 in `u=a1...`."""
+    parsed = urlparse(href)
+    if not parsed.netloc.endswith("bing.com") or not parsed.path.startswith("/ck/"):
+        return href
+    encoded = parse_qs(parsed.query).get("u", [""])[0]
+    if not encoded.startswith("a1"):
+        return href
+    encoded = encoded[2:]
+    try:
+        return base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return href
+
+
 browser_tools = BrowserToolManager()
