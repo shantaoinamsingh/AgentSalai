@@ -45,3 +45,8 @@ web.config
 startup.sh
 Dockerfile
 docker-compose.yml
+
+# Local-only state
+trusted_domains.json
+screenshots/
+.claude/
