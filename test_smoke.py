@@ -1044,3 +1044,65 @@ def test_web_search_fallback_reports_its_own_failure(monkeypatch):
     app_module = _fallback_setup(monkeypatch, search)
     answer = app_module.get_answer("anything", "fallback-chat-2", "fallback-user-2")
     assert "API key" in answer and "web search" in answer and "failed" in answer
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("hello", "How can I help"),
+        ("Hi!", "How can I help"),
+        ("hiii", "How can I help"),
+        ("Hey Salai 👋", "How can I help"),
+        ("good morning", "Good morning!"),
+        ("hi, how are you?", "doing well"),
+        ("what's up", "doing well"),
+        ("thanks!", "welcome"),
+        ("thank you so much", "welcome"),
+        ("thanks, bye", "Goodbye"),
+        ("see you later", "Goodbye"),
+        ("who are you?", "I'm Salai"),
+        ("what can you do", "I can:"),
+        ("help", "I can:"),
+    ],
+)
+def test_small_talk_is_answered_locally(text, expected):
+    import small_talk
+
+    reply = small_talk.reply_for(text)
+    assert reply is not None and expected in reply
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hi, can you summarise this report?",
+        "hello what is the capital of australia",
+        "help me write an email",
+        "thanks, now make it a table",
+        "ok",
+        "yes",
+        "say hello in french",
+        "",
+    ],
+)
+def test_real_requests_still_go_to_the_model(text):
+    import small_talk
+
+    assert small_talk.reply_for(text) is None
+
+
+def test_greeting_skips_the_model_and_web_search(monkeypatch):
+    import app as app_module
+
+    def boom(*a, **k):
+        raise AssertionError("model or web search should not be called for a greeting")
+
+    monkeypatch.setattr(app_module.providers, "chat", boom)
+    monkeypatch.setattr(app_module.providers, "chat_with_tools", boom)
+    monkeypatch.setattr(app_module, "_web_search_fallback", boom)
+
+    answer = app_module.get_answer("hello", "greet-chat", "greet-user")
+    assert "How can I help" in answer
+    from chat_store import chat_store
+
+    assert [m["role"] for m in chat_store.get_history("greet-chat")][-2:] == ["user", "assistant"]

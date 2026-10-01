@@ -106,6 +106,25 @@ PROVIDERS: Dict[str, ProviderSpec] = {
         can_list_models=True,
         key_url="https://aistudio.google.com/apikey",
     ),
+    "groq": ProviderSpec(
+        id="groq",
+        label="Groq",
+        kind="openai",
+        needs_key=True,
+        description="Very fast inference for open models such as Llama, Qwen and GPT-OSS.",
+        models=[
+            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3-32b",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "llama-3.1-8b-instant",
+        ],
+        default_model="llama-3.3-70b-versatile",
+        base_url="https://api.groq.com/openai/v1",
+        can_list_models=True,
+        key_url="https://console.groq.com/keys",
+    ),
     "openrouter": ProviderSpec(
         id="openrouter",
         label="OpenRouter",
@@ -257,7 +276,8 @@ def _openai_chat(
     except requests.exceptions.RequestException as e:
         raise ProviderError(f"Could not reach {spec.label}: {e}")
 
-    if r.status_code == 404:
+    # Groq reports retired models as 400 "model_decommissioned" rather than 404.
+    if r.status_code == 404 or (r.status_code == 400 and "decommissioned" in r.text):
         raise ProviderError(_http_message(spec, r) + _suggest_models(spec, model, api_key, base_url))
     if r.status_code != 200:
         raise ProviderError(_http_message(spec, r))
@@ -293,7 +313,7 @@ def _suggest_models(spec: ProviderSpec, model: str, api_key: Optional[str], base
     except Exception:
         return ""
     family = model.split("-")[0].lower()
-    skip = ("embedding", "tts", "image", "audio", "aqa", "live")
+    skip = ("embedding", "tts", "image", "audio", "aqa", "live", "whisper", "guard")
     matches = [i for i in ids if i.lower().startswith(family) and not any(s in i.lower() for s in skip)]
     picks = (matches or ids)[:8]
     return f" Models available to this key include: {', '.join(picks)}. Pick one in Settings." if picks else ""
@@ -617,7 +637,7 @@ def supports_tools(provider_id: str) -> bool:
     """
     get_spec(provider_id)
     # Many self-hosted models reject a `tools` payload, so leave them out.
-    return provider_id in ("openai", "anthropic", "gemini", "openrouter")
+    return provider_id in ("openai", "anthropic", "gemini", "groq", "openrouter")
 
 
 def get_tools_for_provider(provider_id: str) -> List[Dict[str, Any]]:

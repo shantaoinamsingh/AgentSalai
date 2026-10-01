@@ -40,6 +40,7 @@ load_dotenv()
 
 import exporters  # noqa: E402
 import providers  # noqa: E402
+import small_talk  # noqa: E402
 import chat_store as chat_store_limits  # noqa: E402
 from chat_store import chat_store  # noqa: E402
 from knowledge_base import SUPPORTED_EXTENSIONS, kb  # noqa: E402
@@ -300,6 +301,13 @@ def get_answer(user_input: str, chat_id: str, user_id: str, ask_permission=None)
     user_input = (user_input or "").strip()
     if not user_input:
         return "Please enter a question."
+
+    canned = small_talk.reply_for(user_input, can_browse=HAS_BROWSER_TOOLS)
+    if canned:
+        logger.info("[chat %s] small talk answered locally", chat_id[:8])
+        chat_store.append_message(chat_id, "user", user_input)
+        chat_store.append_message(chat_id, "assistant", canned)
+        return canned
 
     messages, meta = build_messages(chat_id, user_input, user_id)
     settings = settings_store.get(user_id)
